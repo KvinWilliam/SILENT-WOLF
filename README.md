@@ -17,16 +17,15 @@ Au chargement ou après une modification de zone, les signaux sont recalculés s
 
 La rubrique **INTERPRETATION** compare le sens du signal aux divergences RSI 7 et 14 à la confirmation : concordante si elles vont dans le sens du signal, opposée si elles vont dans le sens contraire, mixte si les deux sens sont présents, aucune s'il n'y a pas de divergence, et `n/d` si les données nécessaires manquent. Un résultat marqué `partiel` repose sur des données incomplètes ; il ne signifie pas que l'autre sens est absent.
 
-## Tendance et volumes
+## Tendance et VWAP
 
 **TENDANCE EMA** est informative et indépendante du signal. Elle compare les EMA 50, 100 et 200 sur la dernière bougie clôturée du TF affiché : haussière si EMA 50 > EMA 100 > EMA 200, baissière dans l'ordre inverse, et indécise sinon. Les données insuffisantes sont indiquées par `n/d`.
 
-**VOLUMES** présente un profil des volumes exécutés par prix sur les 100 dernières bougies du TF, bougie courante incluse. Le nombre de bougies, les 50 gammes de prix et la zone de valeur à 70 % sont modifiables dans les paramètres. Le profil est actualisé par le timer, au plus une fois toutes les cinq secondes.
+Le **VWAP** est un indicateur de contexte, sans effet sur la sélection des signaux ou des alertes. Il est calculé avec le prix moyen de chaque bougie `(haut + bas + clôture) / 3`, pondéré par son **volume de ticks**, bougie courante comprise. Il s'agit d'une approximation à partir des bougies, pas d'un volume exécuté ni d'un carnet d'ordres.
 
-- **POC** : milieu de la gamme ayant le plus grand volume exécuté.
-- **VAH / VAL** : limites haute et basse de la zone de valeur. À partir du POC, les gammes adjacentes les plus volumineuses sont ajoutées jusqu'à atteindre le pourcentage demandé ; à égalité, la gamme basse est choisie.
+Sur M5, M15 et M30, le calcul repart à minuit chaque jour ; sur H1 et H4, il repart le lundi à minuit. Ces limites utilisent l'heure du serveur du courtier et la période de la bougie courante : en l'absence de nouvelles bougies, la dernière période reste affichée. Les lignes VWAP sont masquées sur les autres TF.
 
-Ce profil utilise l'historique des transactions fourni par le courtier, pas les volumes de ticks ni le carnet d'ordres en attente. Il exige des ticks identifiés comme transactions avec leur prix et leur volume, et vérifie leur somme contre le volume réel de chaque bougie. Si ces données manquent, sont incomplètes ou changent pendant le calcul, il affiche `n/d` ; aucun volume de remplacement n'est inventé. Le calcul est limité à un million de ticks, y compris les cotations, par passe et à une seconde par tentative ; au-delà, la limite atteinte est indiquée. Cette limitation ou l'absence de volumes exécutés peut notamment concerner le Forex et les indices synthétiques.
+Le panneau indique la valeur, l'orientation par comparaison au VWAP calculé sans la bougie courante, et la distance signée `(clôture courante - VWAP) / ATR` ; l'ATR utilise la dernière bougie clôturée et `InpAtrPeriod` (14 par défaut). Le contexte est **aligné** pour un achat si le prix est au-dessus et le VWAP monte, ou pour une vente si le prix est au-dessous et le VWAP descend. Il compare le contexte actuel au dernier signal affiché, même si celui-ci a expiré. Les valeurs sont mises à jour par le timer toutes les cinq secondes ; une orientation exige au moins une bougie précédente avec du volume dans la même période. `n/d` indique des données insuffisantes ou indisponibles. L'auto-compaction peut masquer des lignes si le graphique est trop petit.
 
 Les anciennes rubriques Actions, Sweep du jour et Taux de réussite ainsi que le suivi statistique associé ont été retirés. Les fichiers statistiques déjà présents dans le dossier de données MT5 ne sont pas supprimés.
 
@@ -37,8 +36,10 @@ Les anciennes rubriques Actions, Sweep du jour et Taux de réussite ainsi que le
 3. Ouvrez le fichier `.mq5` dans MetaEditor et compilez-le.
 4. Dans le Navigateur de MT5, actualisez **Indicateurs** puis ajoutez l'indicateur au graphique.
 
-Configurez les alertes et, pour le Forex, le décalage GMT du serveur du broker dans les paramètres de l'indicateur. Testez les signaux sur un compte démo avant toute utilisation en conditions réelles.
+Les notifications push sont activées par défaut pour les nouvelles instances (`InpEnablePush=true`) ; vérifiez aussi ce paramètre sur les instances déjà installées. Sur le téléphone, installez MT5 et trouvez votre **MetaQuotes ID** dans les paramètres Messages. Sur MT5 ordinateur, ouvrez **Outils > Options > Notifications**, activez les notifications, renseignez cet ID et utilisez le bouton **Test**. Le terminal doit rester connecté et l'indicateur chargé ; les anciens signaux ne déclenchent pas de notification au chargement. Les erreurs d'envoi et une configuration désactivée sont signalées dans le journal Experts. Les notifications ne fonctionnent pas dans le testeur de stratégie MT5. Un succès d'envoi depuis le terminal ne garantit pas la réception sur le téléphone.
+
+Configurez aussi, pour le Forex, le décalage GMT du serveur du broker dans les paramètres de l'indicateur. Testez les signaux sur un compte démo avant toute utilisation en conditions réelles.
 
 ## Vérification
 
-Avec Node.js, `node tests\indicator-logic.test.js` et `node tests\volume-profile.test.js` vérifient les cas de signal, de tendance et de profil de volumes communs aux deux indicateurs. Ces tests ne remplacent ni la compilation dans MetaEditor ni la vérification sur un graphique MT5.
+Avec Node.js, `node tests\indicator-logic.test.js` et `node tests\vwap.test.js` vérifient les cas de signal, de tendance et de VWAP communs aux deux indicateurs. Ces tests ne remplacent ni la compilation dans MetaEditor ni la vérification sur un graphique MT5.

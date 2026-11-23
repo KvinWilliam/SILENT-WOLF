@@ -87,7 +87,7 @@ input double InpMaxOppositeWickRatio = 1.0;       // 1 = off ; hypothèse à tes
 input bool   InpZoneRequireRejection = false;
 input bool   InpEnableSound          = true;
 input string InpSoundFile            = "alert.wav";
-input bool   InpEnablePush           = false;    // Requires MT5 notifications configured
+input bool   InpEnablePush           = true;     // Requires MT5 notifications configured
 input bool   InpEnableAlertPopup     = true;     // C9 : fenêtre Alert() du terminal
 input bool   InpEnableEmail          = false;    // C9 : SendMail (onglet Email du terminal)
 input bool   InpFallbackToSinglePin  = true;     // Repli pin simple si la fusion échoue
@@ -128,11 +128,6 @@ input bool   InpAutoCompactTable        = true;  // Adapter le nombre de lignes 
 // une modification de zone en cours de barre peut aussi émettre l'alerte
 // (comportement P3 antérieur).
 input bool   InpAlertOnZoneChange       = false; // C-R1 : alerter aussi en cours de barre
-
-input group "Profil de volumes"
-input int    InpVolumeBars = 100;                // Nombre de bougies, bougie courante incluse
-input int    InpVolumeBins = 50;                 // Nombre de gammes de prix
-input double InpVolumeValueAreaPercent = 70.0;   // Pourcentage du volume dans la zone de valeur
 
 input group "Sessions de marché"
 input int   BrokerGMTOffset = 2;    // Décalage GMT du serveur broker (heures, ex: 2 hiver / 3 été)
@@ -194,7 +189,7 @@ bool ChartEventCreateForced = false;       // P5
 bool ChartEventDeleteForced = false;       // P5
 
 // C12: field indexes determine panel rows and colorization.
-const int FieldCount     = 16;
+const int FieldCount     = 17;
 double LatestSignalAdr = EMPTY_VALUE;
 ENUM_REJECTION_REASON CandidateRejection = REJECT_NONE;
 bool CandidatePatternFound = false;
@@ -459,261 +454,102 @@ string SwTrendAt(const int shift)
    return "INDECISE";
 }
 
-struct SwVolumeBounds
+bool SwSupportsVwap()
 {
-   int poc;
-   int lower;
-   int upper;
-};
-
-MqlTick SwVolumeTicks[8192];
-double SwVolumeBins[];
-double SwVolumeMinPrice = 0.0;
-double SwVolumeMaxPrice = 0.0;
-double SwVolumePoc = EMPTY_VALUE;
-double SwVolumeVah = EMPTY_VALUE;
-double SwVolumeVal = EMPTY_VALUE;
-string SwVolumeMessage = "n/d (initialisation)";
-string SwVolumeLastError = "";
-datetime SwVolumeLastErrorTime = 0;
-ulong SwVolumeLastAttempt = 0;
-ulong SwVolumeStarted = 0;
-int SwVolumeProcessedTicks = 0;
-const int SwVolumeTickLimit = 1000000;
-const ulong SwVolumeTimeLimitMs = 1000;
-
-void SwVolumeUnavailable(const string message, const int error = 0)
-{
-   SwVolumePoc = EMPTY_VALUE;
-   SwVolumeVah = EMPTY_VALUE;
-   SwVolumeVal = EMPTY_VALUE;
-   SwVolumeMessage = message;
-   datetime now = TimeLocal();
-   if(message != SwVolumeLastError || now - SwVolumeLastErrorTime >= 60)
-   {
-      Print("SilentWolf : profil de volumes ", message, ", erreur ", error);
-      SwVolumeLastError = message;
-      SwVolumeLastErrorTime = now;
-   }
+   return _Period == PERIOD_M5 || _Period == PERIOD_M15 || _Period == PERIOD_M30
+          || _Period == PERIOD_H1 || _Period == PERIOD_H4;
 }
 
-bool SwProfileBounds(const double &bins[], const double fraction, SwVolumeBounds &bounds)
+datetime SwVwapAnchor(const datetime barTime)
 {
-   int count = ArraySize(bins);
-   if(count < 1 || fraction <= 0.0 || fraction > 1.0)
+   MqlDateTime parts;
+   if(!TimeToStruct(barTime, parts))
+      return 0;
+   int daysBack = 0;
+   if(_Period == PERIOD_H1 || _Period == PERIOD_H4)
+      daysBack = parts.day_of_week == 0 ? 6 : parts.day_of_week - 1;
+   parts.hour = 0;
+   parts.min = 0;
+   parts.sec = 0;
+   return StructToTime(parts) - daysBack * 86400;
+}
+
+double SwVwap = EMPTY_VALUE;
+string SwVwapDirection = "n/d";
+double SwVwapDistanceAtr = EMPTY_VALUE;
+double SwVwapPrice = EMPTY_VALUE;
+
+string SwVwapContext()
+{
+   if(LatestSignalDirection == 0 || SwVwap == EMPTY_VALUE
+      || SwVwapPrice == EMPTY_VALUE || SwVwapDirection == "n/d")
+      return "n/d";
+   if(LatestSignalDirection > 0 && SwVwapPrice > SwVwap && SwVwapDirection == "HAUSSIER")
+      return "ALIGNE";
+   if(LatestSignalDirection < 0 && SwVwapPrice < SwVwap && SwVwapDirection == "BAISSIER")
+      return "ALIGNE";
+   return "NON ALIGNE";
+}
+
+bool SwCalculateVwap(const MqlRates &rates[], double &current, double &previous)
+{
+   int count = ArraySize(rates);
+   if(count < 1)
       return false;
-   double total = 0.0;
-   double peak = -1.0;
-   bounds.poc = 0;
+   double weighted = 0.0, total = 0.0;
+   previous = EMPTY_VALUE;
    for(int i = 0; i < count; ++i)
    {
-      if(!MathIsValidNumber(bins[i]) || bins[i] < 0.0)
+      if(rates[i].tick_volume < 0 || !MathIsValidNumber(rates[i].high)
+         || !MathIsValidNumber(rates[i].low) || !MathIsValidNumber(rates[i].close)
+         || rates[i].high == EMPTY_VALUE || rates[i].low == EMPTY_VALUE
+         || rates[i].close == EMPTY_VALUE)
          return false;
-      total += bins[i];
-      if(bins[i] > peak)
-      {
-         peak = bins[i];
-         bounds.poc = i;
-      }
+      if(i == count - 1 && total > 0.0)
+         previous = weighted / total;
+      double price = (rates[i].high + rates[i].low + rates[i].close) / 3.0;
+      weighted += price * (double)rates[i].tick_volume;
+      total += (double)rates[i].tick_volume;
    }
-   if(total <= 0.0 || !MathIsValidNumber(total))
+   if(total <= 0.0 || !MathIsValidNumber(weighted) || !MathIsValidNumber(total))
       return false;
-   bounds.lower = bounds.poc;
-   bounds.upper = bounds.poc;
-   double included = bins[bounds.poc];
-   while(included < total * fraction && (bounds.lower > 0 || bounds.upper < count - 1))
-   {
-      if(bounds.upper == count - 1
-         || (bounds.lower > 0 && bins[bounds.lower - 1] >= bins[bounds.upper + 1]))
-         included += bins[--bounds.lower];
-      else
-         included += bins[++bounds.upper];
-   }
-   return true;
+   current = weighted / total;
+   return MathIsValidNumber(current);
 }
 
-bool SwScanVolumeTicks(const ulong from, const ulong to, const int pass, double &barVolume)
+void SwUpdateVwap()
 {
-   if(to < from)
-      return true;
-   if(GetTickCount64() - SwVolumeStarted >= SwVolumeTimeLimitMs)
-   {
-      SwVolumeUnavailable("n/d (limite temps)");
-      return false;
-   }
-   ResetLastError();
-   int copied = CopyTicksRange(_Symbol, SwVolumeTicks, COPY_TICKS_ALL, from, to);
-   int error = GetLastError();
-   if(GetTickCount64() - SwVolumeStarted >= SwVolumeTimeLimitMs)
-   {
-      SwVolumeUnavailable("n/d (limite temps)");
-      return false;
-   }
-   // A static buffer may truncate the interval; split without overlapping milliseconds.
-   if(error == 4407)
-   {
-      if(from == to)
-      {
-         SwVolumeUnavailable("n/d (trop de ticks par ms)", error);
-         return false;
-      }
-      ulong middle = from + (to - from) / 2;
-      return SwScanVolumeTicks(from, middle, pass, barVolume)
-             && SwScanVolumeTicks(middle + 1, to, pass, barVolume);
-   }
-   if(copied < 0 || error != 0)
-   {
-      SwVolumeUnavailable("n/d (historique ticks)", error);
-      return false;
-   }
-   if(copied > SwVolumeTickLimit - SwVolumeProcessedTicks)
-   {
-      SwVolumeUnavailable("n/d (limite ticks)");
-      return false;
-   }
-   SwVolumeProcessedTicks += copied;
-   for(int i = 0; i < copied; ++i)
-   {
-      if((SwVolumeTicks[i].flags & (TICK_FLAG_BUY | TICK_FLAG_SELL)) == 0)
-         continue;
-      double price = SwVolumeTicks[i].last;
-      if(!MathIsValidNumber(SwVolumeTicks[i].volume_real) || SwVolumeTicks[i].volume_real < 0.0)
-      {
-         SwVolumeUnavailable("n/d (volume invalide)");
-         return false;
-      }
-      double volume = SwVolumeTicks[i].volume_real > 0.0
-                      ? SwVolumeTicks[i].volume_real : (double)SwVolumeTicks[i].volume;
-      if(price <= 0.0 || !MathIsValidNumber(price)
-         || volume <= 0.0 || !MathIsValidNumber(volume))
-      {
-         SwVolumeUnavailable("n/d (transaction incomplete)");
-         return false;
-      }
-      barVolume += volume;
-      if(pass == 0)
-      {
-         SwVolumeMinPrice = MathMin(SwVolumeMinPrice, price);
-         SwVolumeMaxPrice = MathMax(SwVolumeMaxPrice, price);
-      }
-      else
-      {
-         int index = 0;
-         if(SwVolumeMaxPrice > SwVolumeMinPrice)
-            index = (int)MathFloor((price - SwVolumeMinPrice)
-                                  / (SwVolumeMaxPrice - SwVolumeMinPrice) * InpVolumeBins);
-         if(index < 0 || index > InpVolumeBins)
-         {
-            SwVolumeUnavailable("n/d (prix incoherent)");
-            return false;
-         }
-         if(index == InpVolumeBins) index = InpVolumeBins - 1;
-         SwVolumeBins[index] += volume;
-      }
-   }
-   return true;
-}
-
-bool SwScanVolumeBars(const MqlRates &rates[], const ulong endMsc, const int pass)
-{
-   SwVolumeProcessedTicks = 0;
-   for(int bar = InpVolumeBars - 1; bar >= 0; --bar)
-   {
-      ulong from = (ulong)rates[bar].time * 1000;
-      ulong to = bar == 0 ? endMsc : (ulong)rates[bar - 1].time * 1000 - 1;
-      double barVolume = 0.0;
-      if(!SwScanVolumeTicks(from, to, pass, barVolume))
-         return false;
-      double expected = (double)rates[bar].real_volume;
-      if(expected < 0.0 || !MathIsValidNumber(barVolume)
-         || MathAbs(barVolume - expected) > 1e-8 * MathMax(1.0, expected))
-      {
-         SwVolumeUnavailable("n/d (donnees incompletes)");
-         return false;
-      }
-   }
-   return true;
-}
-
-void SwUpdateVolumeProfile()
-{
-   if(!InpShowTable)
+   if(!InpShowTable || !SwSupportsVwap())
       return;
-   ulong now = GetTickCount64();
-   if(SwVolumeLastAttempt != 0 && now - SwVolumeLastAttempt < 5000)
+   SwVwap = EMPTY_VALUE;
+   SwVwapDirection = "n/d";
+   SwVwapDistanceAtr = EMPTY_VALUE;
+   SwVwapPrice = EMPTY_VALUE;
+   datetime barTime = iTime(_Symbol, _Period, 0);
+   datetime anchor = SwVwapAnchor(barTime);
+   if(barTime <= 0 || anchor <= 0)
       return;
-   SwVolumeLastAttempt = now;
-   SwVolumeStarted = now;
-
    MqlRates rates[];
-   ArraySetAsSeries(rates, true);
-   if(CopyRates(_Symbol, _Period, 0, InpVolumeBars, rates) != InpVolumeBars)
-   {
-      SwVolumeUnavailable("n/d (bougies)");
+   int count = CopyRates(_Symbol, _Period, anchor, barTime, rates);
+   long synchronized = 0, firstDate = 0;
+   if(count < 1 || rates[count - 1].time != barTime
+      || !SeriesInfoInteger(_Symbol, _Period, SERIES_SYNCHRONIZED, synchronized)
+      || synchronized == 0
+      || !SeriesInfoInteger(_Symbol, _Period, SERIES_FIRSTDATE, firstDate)
+      || firstDate <= 0 || firstDate > anchor)
       return;
-   }
-   MqlTick last;
-   if(!SymbolInfoTick(_Symbol, last) || last.time_msc < (long)rates[0].time * 1000)
-   {
-      SwVolumeUnavailable("n/d (heure du symbole)", GetLastError());
+   double current, previous;
+   if(!SwCalculateVwap(rates, current, previous))
       return;
-   }
-   bool hasVolume = false;
-   for(int bar = 0; bar < InpVolumeBars; ++bar)
-      if(rates[bar].real_volume > 0)
-         hasVolume = true;
-   if(!hasVolume)
-   {
-      SwVolumeUnavailable("n/d (volume reel)");
-      return;
-   }
-
-   SwVolumeMinPrice = DBL_MAX;
-   SwVolumeMaxPrice = -DBL_MAX;
-   if(!SwScanVolumeBars(rates, (ulong)last.time_msc, 0))
-      return;
-   if(SwVolumeMinPrice == DBL_MAX || SwVolumeMaxPrice < SwVolumeMinPrice)
-   {
-      SwVolumeUnavailable("n/d (transactions)");
-      return;
-   }
-   if(ArrayResize(SwVolumeBins, InpVolumeBins) != InpVolumeBins)
-   {
-      SwVolumeUnavailable("n/d (memoire)", GetLastError());
-      return;
-   }
-   ArrayInitialize(SwVolumeBins, 0.0);
-   if(!SwScanVolumeBars(rates, (ulong)last.time_msc, 1))
-      return;
-
-   MqlRates check[];
-   ArraySetAsSeries(check, true);
-   if(CopyRates(_Symbol, _Period, 0, InpVolumeBars, check) != InpVolumeBars)
-   {
-      SwVolumeUnavailable("n/d (bougies)");
-      return;
-   }
-   for(int bar = 0; bar < InpVolumeBars; ++bar)
-      if(check[bar].time != rates[bar].time || check[bar].real_volume != rates[bar].real_volume)
-      {
-         SwVolumeUnavailable("n/d (mise a jour)");
-         return;
-      }
-
-   SwVolumeBounds bounds;
-   if(!SwProfileBounds(SwVolumeBins, InpVolumeValueAreaPercent / 100.0, bounds))
-   {
-      SwVolumeUnavailable("n/d (profil invalide)");
-      return;
-   }
-   double step = (SwVolumeMaxPrice - SwVolumeMinPrice) / InpVolumeBins;
-   SwVolumePoc = NormalizeDouble(SwVolumeMinPrice + (bounds.poc + 0.5) * step, _Digits);
-   SwVolumeVal = NormalizeDouble(SwVolumeMinPrice + bounds.lower * step, _Digits);
-   SwVolumeVah = NormalizeDouble(SwVolumeMinPrice + (bounds.upper + 1) * step, _Digits);
-   SwVolumeMessage = "";
-   SwVolumeLastError = "";
+   SwVwap = current;
+   SwVwapPrice = rates[count - 1].close;
+   if(previous != EMPTY_VALUE && rates[count - 1].tick_volume > 0)
+      SwVwapDirection = current > previous ? "HAUSSIER" : current < previous ? "BAISSIER" : "PLAT";
+   double atr[];
+   if(AtrHandle != INVALID_HANDLE && CopyBuffer(AtrHandle, 0, 1, 1, atr) == 1
+      && MathIsValidNumber(atr[0]) && atr[0] != EMPTY_VALUE && atr[0] > 0.0)
+      SwVwapDistanceAtr = (rates[count - 1].close - current) / atr[0];
 }
-
 
 void SwRefreshInfo()
 {
@@ -1796,6 +1632,7 @@ int TableColumnCount(const int section)
 // Nombre de lignes affichées par section, en-tête inclus.
 int TableSectionRowCount()
 {
+   int visibleFields = SwSupportsVwap() ? FieldCount : FieldCount - 4;
    if(InpAutoCompactTable)
    {
       long height = ChartGetInteger(0, CHART_HEIGHT_IN_PIXELS);
@@ -1803,11 +1640,11 @@ int TableSectionRowCount()
       {
          int available = (int)height - TableTitleBarHeight - TableBottomMargin
                          - 24 - TableHeaderRowHeight;
-         int dataRows = (int)MathMax(0, MathMin(FieldCount, available / TableRowHeight));
+         int dataRows = (int)MathMax(0, MathMin(visibleFields, available / TableRowHeight));
          return 1 + dataRows;
       }
    }
-   return FieldCount + 1;
+   return visibleFields + 1;
 }
 
 int TableFieldForRow(const int row)
@@ -1815,10 +1652,15 @@ int TableFieldForRow(const int row)
    if(row == 4) return 12;
    if(row == 5) return 11;
    if(row == 6) return 10;
-   if(row == 7) return 13;
-   if(row == 8) return 14;
-   if(row == 9) return 15;
-   return row > 9 ? row - 7 : row - 1;
+   if(SwSupportsVwap())
+   {
+      if(row == 7) return 13;
+      if(row == 8) return 14;
+      if(row == 9) return 15;
+      if(row == 10) return 16;
+      return row > 10 ? row - 8 : row - 1;
+   }
+   return row > 6 ? row - 4 : row - 1;
 }
 
 int TableColumnWidth(const int section, const int column)
@@ -1902,9 +1744,10 @@ string TableLabelCellText(const int field)
    if(field == 10) return "TENDANCE EMA";
    if(field == 11) return "INTERPRETATION";
    if(field == 12) return "ETAT";
-   if(field == 13) return "VOLUMES / POC";
-   if(field == 14) return "VOLUMES / VAH";
-   if(field == 15) return "VOLUMES / VAL";
+   if(field == 13) return "VWAP";
+   if(field == 14) return "VWAP ORIENTATION";
+   if(field == 15) return "VWAP DISTANCE / ATR";
+   if(field == 16) return "VWAP / SIGNAL";
    return "";
 }
 
@@ -2086,9 +1929,11 @@ string TableCellText(const int section, const int row, const int column)
    int field = TableFieldForRow(row);
    if(column == 0) return TableLabelCellText(field);
    if(field == 10) return SwCurrentTrend;
-   if(field == 13) return SwVolumePoc == EMPTY_VALUE ? SwVolumeMessage : PriceText(SwVolumePoc);
-   if(field == 14) return PriceText(SwVolumeVah);
-   if(field == 15) return PriceText(SwVolumeVal);
+   if(field == 13) return PriceText(SwVwap);
+   if(field == 14) return SwVwapDirection;
+   if(field == 15) return SwVwapDistanceAtr == EMPTY_VALUE ? "n/d"
+                          : DoubleToString(SwVwapDistanceAtr, 2) + " ATR";
+   if(field == 16) return SwVwapContext();
    if(LatestSignalTime == 0) return "--";
    if(field == 0) return TimeToString(LatestSignalTime, TIME_DATE | TIME_MINUTES);
    if(field == 1) return ShortPatternName(LatestSignalName);
@@ -2169,7 +2014,7 @@ void MeasureTableMetrics()
    string samples[6] = {"Harami Cross / Étoile filante",
                         "SURACHAT (100.0 / 100.0)", "1234567.89 (12.34 R)",
                         "1234567.89 USD", "7:HAUSS. (partiel) 14:BAISS. (partiel)",
-                        "n/d (donnees incompletes)"};
+                        "+123.45 ATR"};
    int valueWidth = 0;
    for(int index = 0; index < 6; ++index)
       if(TextGetSize(samples[index], width, height) && (int)width > valueWidth)
@@ -2390,8 +2235,14 @@ void RaiseAlert(const string message)
    {
       if(!TerminalInfoInteger(TERMINAL_NOTIFICATIONS_ENABLED))
          Print("Notification ignorée : les notifications MT5 ne sont pas activées.");
-      else if(!SendNotification(message))
-         Print("SendNotification a échoué. Erreur: ", GetLastError());
+      else if(MQLInfoInteger(MQL_TESTER))
+         Print("Notification impossible : SendNotification ne fonctionne pas dans le testeur MT5.");
+      else
+      {
+         ResetLastError();
+         if(!SendNotification(StringSubstr(message, 0, 255)))
+            Print("SendNotification a échoué. Erreur: ", GetLastError());
+      }
    }
    if(InpEnableEmail)
    {
@@ -2413,10 +2264,6 @@ int OnInit()
    }
    if(InpWickBodyRatio <= 0.0 || InpArrowOffsetPoints < 0
       || InpMaxBarsToScan < 1
-      || InpVolumeBars < 1 || InpVolumeBars > 5000
-      || InpVolumeBins < 1 || InpVolumeBins > 500
-      || !MathIsValidNumber(InpVolumeValueAreaPercent)
-      || InpVolumeValueAreaPercent <= 0.0 || InpVolumeValueAreaPercent > 100.0
       || InpSwingLookbackBars < 1
       || InpPinSwingLookbackBars < 1 || InpPinSwingLookbackM5 < 1
       || InpPinSwingLookbackM15 < 1 || InpPinSwingLookbackM30 < 1
@@ -2466,8 +2313,10 @@ int OnInit()
    // C6 : l'ATR est aussi nécessaire au filtre de taille, pas seulement au stop.
    bool atrRequired = InpStopBufferMode == STOP_BUFFER_ATR
                       || InpMinRangeAtr > 0.0;
-   if(atrRequired)
+   if(atrRequired || (InpShowTable && SwSupportsVwap()))
       AtrHandle = iATR(_Symbol, _Period, InpAtrPeriod);
+   if(!atrRequired && InpShowTable && SwSupportsVwap() && AtrHandle == INVALID_HANDLE)
+      Print("ATR du VWAP indisponible. Erreur: ", GetLastError());
    if(atrRequired && AtrHandle == INVALID_HANDLE)
    {
       Print("Impossible de créer les handles RSI/ATR. Erreur: ", GetLastError());
@@ -2477,6 +2326,10 @@ int OnInit()
    }
 
    SwInitHandles();
+   if(InpEnablePush && MQLInfoInteger(MQL_TESTER))
+      Print("Notifications push indisponibles dans le testeur MT5.");
+   else if(InpEnablePush && !TerminalInfoInteger(TERMINAL_NOTIFICATIONS_ENABLED))
+      Print("Notifications push désactivées dans MT5 : configurez l'onglet Notifications et le MetaQuotes ID.");
 
    SetIndexBuffer(0, BullishBuffer, INDICATOR_DATA);
    SetIndexBuffer(1, BearishBuffer, INDICATOR_DATA);
@@ -3517,7 +3370,7 @@ void OnTimer()
 {
    DrawTradingSessions();
    SwRefreshInfo();
-   SwUpdateVolumeProfile();
+   SwUpdateVwap();
    if(InpShowTable) UpdateSignalTable();
 }
 
