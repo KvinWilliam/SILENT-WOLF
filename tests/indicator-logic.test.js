@@ -107,10 +107,13 @@ for (const path of paths) {
     SwLatestDivergence: "n/d",
     SwLatestDiv7: "n/d",
     SwLatestDiv14: "n/d",
-    SwVolumePoc: 100,
-    SwVolumeVah: 110,
-    SwVolumeVal: 90,
-    SwVolumeMessage: "n/d (volume reel)",
+    SwVwap: 100,
+    SwVwapDirection: "HAUSSIER",
+    SwVwapDistanceAtr: 1.25,
+    SwVwapContext: () => "n/d",
+    SwSupportsVwap: () => context.supportsVwap,
+    supportsVwap: true,
+    DoubleToString: (value, digits) => value.toFixed(digits),
     TableLabelCellText: () => "LABEL",
     PriceText: value => value === Infinity ? "n/d" : String(value),
     SwTrendAt: shift => shift === 1 ? "HAUSSIERE" : "incorrect",
@@ -184,17 +187,20 @@ for (const path of paths) {
     { index: 1, time: 99, direction: -1, status: "SORTIE CONTRAIRE" });
   assert.deepEqual(runSelection(source, {}, {}, -1),
     { index: -1, time: 0, direction: 0, status: "--" });
-  assert.deepEqual(Array.from({ length: 16 }, (_, i) => context.TableFieldForRow(i + 1)),
-    [0, 1, 2, 12, 11, 10, 13, 14, 15, 3, 4, 5, 6, 7, 8, 9]);
+  assert.deepEqual(Array.from({ length: 17 }, (_, i) => context.TableFieldForRow(i + 1)),
+    [0, 1, 2, 12, 11, 10, 13, 14, 15, 16, 3, 4, 5, 6, 7, 8, 9]);
   context.SwRefreshInfo();
   assert.equal(context.TableCellText(0, 6, 1), "HAUSSIERE");
   assert.equal(context.TableCellText(0, 7, 1), "100");
-  assert.equal(context.TableCellText(0, 8, 1), "110");
-  assert.equal(context.TableCellText(0, 9, 1), "90");
+  assert.equal(context.TableCellText(0, 8, 1), "HAUSSIER");
+  assert.equal(context.TableCellText(0, 9, 1), "1.25 ATR");
   assert.equal(context.TableCellText(0, 1, 1), "--");
-  context.SwVolumePoc = context.SwVolumeVah = context.SwVolumeVal = Infinity;
-  assert.equal(context.TableCellText(0, 7, 1), "n/d (volume reel)");
-  assert.equal(context.TableCellText(0, 8, 1), "n/d");
+  context.SwVwap = context.SwVwapDistanceAtr = Infinity;
+  assert.equal(context.TableCellText(0, 7, 1), "n/d");
+  assert.equal(context.TableCellText(0, 9, 1), "n/d");
+  context.supportsVwap = false;
+  assert.deepEqual(Array.from({ length: 13 }, (_, i) => context.TableFieldForRow(i + 1)),
+    [0, 1, 2, 12, 11, 10, 3, 4, 5, 6, 7, 8, 9]);
   assert.equal((source.match(/BullishBuffer\[latestSignalIndex\] =/g) || []).length, 1);
   assert.equal((source.match(/BearishBuffer\[latestSignalIndex\] =/g) || []).length, 1);
   assert(!/SwStats|SwSweep|SwAction|TAUX DE REUSSITE|SWEEP DU JOUR|ACTIONS/.test(source));
