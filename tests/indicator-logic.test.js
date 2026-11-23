@@ -39,11 +39,58 @@ function translate(code) {
       "((exitDirection = exits[bar] || 0), exitDirection !== 0)");
 }
 
+function runSelection(source, candidates, statuses, previousShift = -1, exits = {}) {
+  const start = source.indexOf("   for(int i = oldestSignalIndex; i >= 1; --i)");
+  const end = source.indexOf('   if(fullRecalculation)\n      PrintFormat("SilentWolf : patterns=', start);
+  assert(start >= 0 && end > start);
+  const selection = source.slice(start, end)
+    .replace(/bool accepted = FindConfirmedSignal\(i,[\s\S]*?patternName, signalStopPrice\);/,
+      `bool accepted = (([direction, patternIndex, patternLength, patternName, signalStopPrice] =
+        candidates[i] || [0, 0, 0, "", 0]), !!candidates[i]);`)
+    .replace(/\(int\)/g, "")
+    .replace(/\b(?:ENUM_INDICATOR_READ|datetime|bool|string|int|double)\s+/g, "let ");
+  const context = {
+    candidates, statuses, exits, EMPTY_VALUE: Infinity,
+    time: Array.from({ length: 20 }, (_, i) => 100 - i),
+    open: [], high: [], low: [], close: Array(20).fill(100),
+    InpSwingLookbackBars: 1, rates_total: 20, oldestSignalIndex: 4, previousShift,
+    previousTime: previousShift < 0 ? 0 : 100 - previousShift,
+    previousDirection: 1, previousName: "ancien",
+    previousEntry: 100, previousRisk: 1, previousStop: 90,
+    ActiveSignalTime: 0, ActiveSignalDirection: 0,
+    PositionStateInitialized: true, REJECT_NONE: 0, INDICATOR_READ_PENDING: 1,
+    IsConfirmedSwingPivot: () => true, EstimateLoss: () => 1,
+    EffectiveMaxSignalAgeBars: () => 1,
+    AdrAtSignal: () => 0, ReportDataIssue: () => {},
+    SignalStatus: index => statuses[index],
+    SignalIsActive: status => status === "ACTIF" || status === "TP1 ATTEINT",
+    HasOppositeExit: index => !!exits[index],
+  };
+  vm.createContext(context);
+  vm.runInContext(translate(extract(source, "DisplayedSignalIndex")), context);
+  vm.runInContext(`
+    let bullishSwingSignalUsed = false, bearishSwingSignalUsed = false;
+    let lastBullishSignalTime = 0, lastBearishSignalTime = 0;
+    let currentBarEntrySignal = false, currentBarEntryDirection = 0;
+    let currentBarEntryName = "", currentBarEntryPatternIndex = -1;
+    let trackedSignalFound = false, trackedSignalActive = false;
+    let latestActiveTime = 0, latestActiveDirection = 0;
+    let latestSignalIndex = -1, LatestSignalTime = 0, LatestSignalDirection = 0;
+    let LatestEntry1Price = 0, LatestEntry1Risk = EMPTY_VALUE, LatestStopPrice = EMPTY_VALUE;
+    let LatestSignalName = "", LatestSignalAdr = EMPTY_VALUE, LatestSignalStatus = "--";
+    let CandidateRejection = 0, CandidatePatternFound = false, fullRecalculation = false;
+    ${selection}
+    result = { index: latestSignalIndex, time: LatestSignalTime,
+               direction: LatestSignalDirection, status: LatestSignalStatus };
+  `, context);
+  return JSON.parse(JSON.stringify(context.result));
+}
+
 let baseline;
 for (const path of paths) {
-  const source = fs.readFileSync(path, "utf8");
+  const source = fs.readFileSync(path, "utf8").replace(/\r\n/g, "\n");
   const bodies = ["SignalStatus", "SignalIsActive", "SwInterpretation",
-    "HasOppositeExit", "TableFieldForRow"].map(name => extract(source, name));
+    "HasOppositeExit", "DisplayedSignalIndex", "TableFieldForRow"].map(name => extract(source, name));
   if (baseline) assert.deepEqual(bodies, baseline);
   else baseline = bodies;
 
@@ -101,8 +148,26 @@ for (const path of paths) {
   assert.equal(context.HasOppositeExit(4, 1), true);
   assert.equal(context.HasOppositeExit(2, 1), false);
 
-  assert.deepEqual(Array.from({ length: 12 }, (_, i) => context.TableFieldForRow(i + 1)),
-    [0, 1, 2, 11, 3, 4, 5, 6, 7, 8, 9, 10]);
+  // Keep the previous signal past the rescan window, but replace it when a new one appears.
+  assert.equal(context.DisplayedSignalIndex(-1, 20001, 20000), 20001);
+  assert.equal(context.DisplayedSignalIndex(1, 20001, 20000), 1);
+  assert.equal(context.DisplayedSignalIndex(-1, 100, 20000), -1);
+  assert.equal(context.DisplayedSignalIndex(-1, -1, 20000), -1);
+  const old = [1, 4, 1, "ancien", 90];
+  const recent = [-1, 2, 1, "recent", 110];
+  assert.deepEqual(runSelection(source, { 3: old, 1: recent },
+    { 3: "ACTIF", 1: "STOP TOUCHÉ" }),
+  { index: 1, time: 99, direction: -1, status: "STOP TOUCHÉ" });
+  assert.deepEqual(runSelection(source, {}, { 10: "PÉRIMÉ" }, 10),
+    { index: 10, time: 90, direction: 1, status: "PÉRIMÉ" });
+  assert.deepEqual(runSelection(source, { 1: recent }, { 1: "ACTIF" }, 10),
+    { index: 1, time: 99, direction: -1, status: "ACTIF" });
+  assert.deepEqual(runSelection(source, { 1: recent }, { 1: "ACTIF" }, -1, { 1: true }),
+    { index: 1, time: 99, direction: -1, status: "SORTIE CONTRAIRE" });
+  assert.deepEqual(runSelection(source, {}, {}, -1),
+    { index: -1, time: 0, direction: 0, status: "--" });
+  assert.deepEqual(Array.from({ length: 13 }, (_, i) => context.TableFieldForRow(i + 1)),
+    [0, 1, 2, 12, 11, 3, 4, 5, 6, 7, 8, 9, 10]);
   assert.equal((source.match(/BullishBuffer\[latestSignalIndex\] =/g) || []).length, 1);
   assert.equal((source.match(/BearishBuffer\[latestSignalIndex\] =/g) || []).length, 1);
   assert(!/SwStats|SwSweep|SwAction|TAUX DE REUSSITE|SWEEP DU JOUR|ACTIONS/.test(source));

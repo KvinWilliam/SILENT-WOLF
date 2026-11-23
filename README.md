@@ -11,7 +11,9 @@ Les deux fichiers sont des indicateurs personnalisés MT5, pas des Expert Adviso
 
 ## Signal et interprétation
 
-Chaque indicateur affiche au maximum une flèche et un panneau pour le dernier signal encore actif sur le symbole et l'unité de temps du graphique. Un signal n'est plus actif après expiration, stop, TP2, ordre intrabar indéterminé ou confirmation d'une sortie opposée. TP1 seul ne termine pas le signal. Le suivi du stop et des objectifs inclut la bougie en cours ; si l'ADR nécessaire aux objectifs est indisponible, ceux-ci ne peuvent pas être vérifiés. Les signaux historiques sont recalculés à partir des zones présentes actuellement.
+Chaque indicateur affiche au maximum une flèche et un panneau pour le dernier signal confirmé sur le symbole et l'unité de temps du graphique. Il reste affiché jusqu'au prochain signal, même s'il n'est plus actif ; la ligne **ETAT** indique notamment son expiration, le stop, TP2 ou une sortie opposée. TP1 seul ne termine pas le signal. Le suivi du stop et des objectifs inclut la bougie en cours ; si l'ADR nécessaire aux objectifs est indisponible, ceux-ci ne peuvent pas être vérifiés.
+
+Au chargement ou après une modification de zone, les signaux sont recalculés sur l'historique disponible et les zones actuelles. Entre ces recalculs, `InpMaxBarsToScan` limite le nombre de bougies rescannées ; le dernier signal déjà trouvé reste affiché même lorsqu'il sort de cette plage, tant que sa bougie reste disponible dans l'historique.
 
 La rubrique **INTERPRETATION** compare le sens du signal aux divergences RSI 7 et 14 à la confirmation : concordante si elles vont dans le sens du signal, opposée si elles vont dans le sens contraire, mixte si les deux sens sont présents, aucune s'il n'y a pas de divergence, et `n/d` si les données nécessaires manquent. Un résultat marqué `partiel` repose sur des données incomplètes ; il ne signifie pas que l'autre sens est absent.
 
