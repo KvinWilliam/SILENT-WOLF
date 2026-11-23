@@ -10,7 +10,7 @@ const paths = [
 ];
 
 function extract(source, name) {
-  const start = source.search(new RegExp("\\b(?:string|bool|int) " + name + "\\("));
+  const start = source.search(new RegExp("\\b(?:string|bool|int|void) " + name + "\\("));
   assert(start >= 0, name + " missing");
   const open = source.indexOf("{", start);
   let depth = 1;
@@ -25,12 +25,12 @@ function extract(source, name) {
 
 function translate(code) {
   return code
-    .replace(/\b(?:string|bool|int)\s+(\w+)\(([^)]*)\)/,
+    .replace(/\b(?:string|bool|int|void)\s+(\w+)\(([^)]*)\)/,
       (_, name, args) => "function " + name + "(" +
         args.replace(/\bconst\s+/g, "")
           .replace(/\b(?:int|double|string|datetime)\s*&?\s*/g, "")
           .replace(/\[\]/g, "") + ")")
-    .replace(/\b(?:bool|string|int|double)\s+/g, "let ")
+    .replace(/\b(?:bool|string|int|double|datetime)\s+/g, "let ")
     .replace(/TargetPrice\(entry, stop, direction, adr, 1, tp1\)/g,
       "((tp1 = target1), target1 !== null)")
     .replace(/TargetPrice\(entry, stop, direction, adr, 2, tp2\)/g,
@@ -90,7 +90,8 @@ let baseline;
 for (const path of paths) {
   const source = fs.readFileSync(path, "utf8").replace(/\r\n/g, "\n");
   const bodies = ["SignalStatus", "SignalIsActive", "SwInterpretation",
-    "HasOppositeExit", "DisplayedSignalIndex", "TableFieldForRow"].map(name => extract(source, name));
+    "HasOppositeExit", "DisplayedSignalIndex", "TableFieldForRow",
+    "TableCellText", "SwRefreshInfo"].map(name => extract(source, name));
   if (baseline) assert.deepEqual(bodies, baseline);
   else baseline = bodies;
 
@@ -99,6 +100,23 @@ for (const path of paths) {
     StringFind: (text, part) => text.indexOf(part),
     MathIsValidNumber: Number.isFinite,
     EffectiveMaxSignalAgeBars: () => context.maxAge,
+    LatestSignalTime: 0,
+    LatestSignalDirection: 0,
+    SwCurrentTrend: "n/d",
+    SwLatestRsi: "n/d",
+    SwLatestDivergence: "n/d",
+    SwLatestDiv7: "n/d",
+    SwLatestDiv14: "n/d",
+    SwVolumePoc: 100,
+    SwVolumeVah: 110,
+    SwVolumeVal: 90,
+    SwVolumeMessage: "n/d (volume reel)",
+    TableLabelCellText: () => "LABEL",
+    PriceText: value => value === Infinity ? "n/d" : String(value),
+    SwTrendAt: shift => shift === 1 ? "HAUSSIERE" : "incorrect",
+    iBarShift: () => -1,
+    _Symbol: "TEST",
+    _Period: 1,
     maxAge: 6,
     target1: 110,
     target2: 130,
@@ -166,8 +184,17 @@ for (const path of paths) {
     { index: 1, time: 99, direction: -1, status: "SORTIE CONTRAIRE" });
   assert.deepEqual(runSelection(source, {}, {}, -1),
     { index: -1, time: 0, direction: 0, status: "--" });
-  assert.deepEqual(Array.from({ length: 13 }, (_, i) => context.TableFieldForRow(i + 1)),
-    [0, 1, 2, 12, 11, 3, 4, 5, 6, 7, 8, 9, 10]);
+  assert.deepEqual(Array.from({ length: 16 }, (_, i) => context.TableFieldForRow(i + 1)),
+    [0, 1, 2, 12, 11, 10, 13, 14, 15, 3, 4, 5, 6, 7, 8, 9]);
+  context.SwRefreshInfo();
+  assert.equal(context.TableCellText(0, 6, 1), "HAUSSIERE");
+  assert.equal(context.TableCellText(0, 7, 1), "100");
+  assert.equal(context.TableCellText(0, 8, 1), "110");
+  assert.equal(context.TableCellText(0, 9, 1), "90");
+  assert.equal(context.TableCellText(0, 1, 1), "--");
+  context.SwVolumePoc = context.SwVolumeVah = context.SwVolumeVal = Infinity;
+  assert.equal(context.TableCellText(0, 7, 1), "n/d (volume reel)");
+  assert.equal(context.TableCellText(0, 8, 1), "n/d");
   assert.equal((source.match(/BullishBuffer\[latestSignalIndex\] =/g) || []).length, 1);
   assert.equal((source.match(/BearishBuffer\[latestSignalIndex\] =/g) || []).length, 1);
   assert(!/SwStats|SwSweep|SwAction|TAUX DE REUSSITE|SWEEP DU JOUR|ACTIONS/.test(source));
