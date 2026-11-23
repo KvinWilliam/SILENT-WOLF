@@ -4,8 +4,8 @@ Indicateurs MetaTrader 5 de détection de figures de retournement, avec panneaux
 
 ## Indicateurs
 
-- **Forex** — `MQL5\Indicators\Forex\PatternFusionPinBarForex.mq5`. Inclut le tracé des sessions de marché (Asie, Francfort, Londres et New York).
-- **Indices synthétiques** — `MQL5\Indicators\SyntheticIndices\PatternFusionPinBarSyntheticIndices.mq5`. N'inclut pas les sessions Forex.
+- **silentwolfforex** — `MQL5\Indicators\Forex\silentwolfforex.mq5`. Inclut le tracé des sessions de marché (Asie, Francfort, Londres et New York).
+- **silentwolfindices** — `MQL5\Indicators\SyntheticIndices\silentwolfindices.mq5`. N'inclut pas les sessions Forex.
 
 Les deux fichiers sont des indicateurs personnalisés MT5, pas des Expert Advisors : ils affichent des signaux et peuvent envoyer des alertes, mais ne passent pas d'ordres.
 

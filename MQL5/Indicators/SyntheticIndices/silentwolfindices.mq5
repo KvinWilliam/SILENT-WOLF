@@ -2690,7 +2690,7 @@ int OnInit()
    PlotIndexSetDouble(0, PLOT_EMPTY_VALUE, EMPTY_VALUE);
    PlotIndexSetDouble(1, PLOT_EMPTY_VALUE, EMPTY_VALUE);
    IndicatorSetInteger(INDICATOR_DIGITS, _Digits);
-   IndicatorSetString(INDICATOR_SHORTNAME, "silentwolf");
+   IndicatorSetString(INDICATOR_SHORTNAME, "silentwolfindices");
    Print("PinBarFusion : les signaux historiques sont recalculés avec les zones actuelles ; "
          "ils ne prouvent pas qu'une zone existait au moment du signal.");
 
