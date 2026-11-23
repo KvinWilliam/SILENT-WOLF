@@ -129,6 +129,11 @@ input bool   InpAutoCompactTable        = true;  // Adapter le nombre de lignes 
 // (comportement P3 antérieur).
 input bool   InpAlertOnZoneChange       = false; // C-R1 : alerter aussi en cours de barre
 
+input group "Profil de volumes"
+input int    InpVolumeBars = 100;                // Nombre de bougies, bougie courante incluse
+input int    InpVolumeBins = 50;                 // Nombre de gammes de prix
+input double InpVolumeValueAreaPercent = 70.0;   // Pourcentage du volume dans la zone de valeur
+
 double BullishBuffer[];
 double BearishBuffer[];
 int AtrHandle = INVALID_HANDLE;
@@ -166,7 +171,7 @@ bool ChartEventCreateForced = false;       // P5
 bool ChartEventDeleteForced = false;       // P5
 
 // C12: field indexes determine panel rows and colorization.
-const int FieldCount     = 13;
+const int FieldCount     = 16;
 double LatestSignalAdr = EMPTY_VALUE;
 ENUM_REJECTION_REASON CandidateRejection = REJECT_NONE;
 bool CandidatePatternFound = false;
@@ -245,7 +250,7 @@ string SwLatestRsi;
 string SwLatestDivergence = "n/d";
 string SwLatestDiv7 = "n/d";
 string SwLatestDiv14 = "n/d";
-string SwLatestTrend = "n/d";
+string SwCurrentTrend = "n/d";
 
 string SwTimeframeName()
 {
@@ -431,13 +436,269 @@ string SwTrendAt(const int shift)
    return "INDECISE";
 }
 
+struct SwVolumeBounds
+{
+   int poc;
+   int lower;
+   int upper;
+};
+
+MqlTick SwVolumeTicks[8192];
+double SwVolumeBins[];
+double SwVolumeMinPrice = 0.0;
+double SwVolumeMaxPrice = 0.0;
+double SwVolumePoc = EMPTY_VALUE;
+double SwVolumeVah = EMPTY_VALUE;
+double SwVolumeVal = EMPTY_VALUE;
+string SwVolumeMessage = "n/d (initialisation)";
+string SwVolumeLastError = "";
+datetime SwVolumeLastErrorTime = 0;
+ulong SwVolumeLastAttempt = 0;
+ulong SwVolumeStarted = 0;
+int SwVolumeProcessedTicks = 0;
+const int SwVolumeTickLimit = 1000000;
+const ulong SwVolumeTimeLimitMs = 1000;
+
+void SwVolumeUnavailable(const string message, const int error = 0)
+{
+   SwVolumePoc = EMPTY_VALUE;
+   SwVolumeVah = EMPTY_VALUE;
+   SwVolumeVal = EMPTY_VALUE;
+   SwVolumeMessage = message;
+   datetime now = TimeLocal();
+   if(message != SwVolumeLastError || now - SwVolumeLastErrorTime >= 60)
+   {
+      Print("SilentWolf : profil de volumes ", message, ", erreur ", error);
+      SwVolumeLastError = message;
+      SwVolumeLastErrorTime = now;
+   }
+}
+
+bool SwProfileBounds(const double &bins[], const double fraction, SwVolumeBounds &bounds)
+{
+   int count = ArraySize(bins);
+   if(count < 1 || fraction <= 0.0 || fraction > 1.0)
+      return false;
+   double total = 0.0;
+   double peak = -1.0;
+   bounds.poc = 0;
+   for(int i = 0; i < count; ++i)
+   {
+      if(!MathIsValidNumber(bins[i]) || bins[i] < 0.0)
+         return false;
+      total += bins[i];
+      if(bins[i] > peak)
+      {
+         peak = bins[i];
+         bounds.poc = i;
+      }
+   }
+   if(total <= 0.0 || !MathIsValidNumber(total))
+      return false;
+   bounds.lower = bounds.poc;
+   bounds.upper = bounds.poc;
+   double included = bins[bounds.poc];
+   while(included < total * fraction && (bounds.lower > 0 || bounds.upper < count - 1))
+   {
+      if(bounds.upper == count - 1
+         || (bounds.lower > 0 && bins[bounds.lower - 1] >= bins[bounds.upper + 1]))
+         included += bins[--bounds.lower];
+      else
+         included += bins[++bounds.upper];
+   }
+   return true;
+}
+
+bool SwScanVolumeTicks(const ulong from, const ulong to, const int pass, double &barVolume)
+{
+   if(to < from)
+      return true;
+   if(GetTickCount64() - SwVolumeStarted >= SwVolumeTimeLimitMs)
+   {
+      SwVolumeUnavailable("n/d (limite temps)");
+      return false;
+   }
+   ResetLastError();
+   int copied = CopyTicksRange(_Symbol, SwVolumeTicks, COPY_TICKS_ALL, from, to);
+   int error = GetLastError();
+   if(GetTickCount64() - SwVolumeStarted >= SwVolumeTimeLimitMs)
+   {
+      SwVolumeUnavailable("n/d (limite temps)");
+      return false;
+   }
+   // A static buffer may truncate the interval; split without overlapping milliseconds.
+   if(error == 4407)
+   {
+      if(from == to)
+      {
+         SwVolumeUnavailable("n/d (trop de ticks par ms)", error);
+         return false;
+      }
+      ulong middle = from + (to - from) / 2;
+      return SwScanVolumeTicks(from, middle, pass, barVolume)
+             && SwScanVolumeTicks(middle + 1, to, pass, barVolume);
+   }
+   if(copied < 0 || error != 0)
+   {
+      SwVolumeUnavailable("n/d (historique ticks)", error);
+      return false;
+   }
+   if(copied > SwVolumeTickLimit - SwVolumeProcessedTicks)
+   {
+      SwVolumeUnavailable("n/d (limite ticks)");
+      return false;
+   }
+   SwVolumeProcessedTicks += copied;
+   for(int i = 0; i < copied; ++i)
+   {
+      if((SwVolumeTicks[i].flags & (TICK_FLAG_BUY | TICK_FLAG_SELL)) == 0)
+         continue;
+      double price = SwVolumeTicks[i].last;
+      if(!MathIsValidNumber(SwVolumeTicks[i].volume_real) || SwVolumeTicks[i].volume_real < 0.0)
+      {
+         SwVolumeUnavailable("n/d (volume invalide)");
+         return false;
+      }
+      double volume = SwVolumeTicks[i].volume_real > 0.0
+                      ? SwVolumeTicks[i].volume_real : (double)SwVolumeTicks[i].volume;
+      if(price <= 0.0 || !MathIsValidNumber(price)
+         || volume <= 0.0 || !MathIsValidNumber(volume))
+      {
+         SwVolumeUnavailable("n/d (transaction incomplete)");
+         return false;
+      }
+      barVolume += volume;
+      if(pass == 0)
+      {
+         SwVolumeMinPrice = MathMin(SwVolumeMinPrice, price);
+         SwVolumeMaxPrice = MathMax(SwVolumeMaxPrice, price);
+      }
+      else
+      {
+         int index = 0;
+         if(SwVolumeMaxPrice > SwVolumeMinPrice)
+            index = (int)MathFloor((price - SwVolumeMinPrice)
+                                  / (SwVolumeMaxPrice - SwVolumeMinPrice) * InpVolumeBins);
+         if(index < 0 || index > InpVolumeBins)
+         {
+            SwVolumeUnavailable("n/d (prix incoherent)");
+            return false;
+         }
+         if(index == InpVolumeBins) index = InpVolumeBins - 1;
+         SwVolumeBins[index] += volume;
+      }
+   }
+   return true;
+}
+
+bool SwScanVolumeBars(const MqlRates &rates[], const ulong endMsc, const int pass)
+{
+   SwVolumeProcessedTicks = 0;
+   for(int bar = InpVolumeBars - 1; bar >= 0; --bar)
+   {
+      ulong from = (ulong)rates[bar].time * 1000;
+      ulong to = bar == 0 ? endMsc : (ulong)rates[bar - 1].time * 1000 - 1;
+      double barVolume = 0.0;
+      if(!SwScanVolumeTicks(from, to, pass, barVolume))
+         return false;
+      double expected = (double)rates[bar].real_volume;
+      if(expected < 0.0 || !MathIsValidNumber(barVolume)
+         || MathAbs(barVolume - expected) > 1e-8 * MathMax(1.0, expected))
+      {
+         SwVolumeUnavailable("n/d (donnees incompletes)");
+         return false;
+      }
+   }
+   return true;
+}
+
+void SwUpdateVolumeProfile()
+{
+   if(!InpShowTable)
+      return;
+   ulong now = GetTickCount64();
+   if(SwVolumeLastAttempt != 0 && now - SwVolumeLastAttempt < 5000)
+      return;
+   SwVolumeLastAttempt = now;
+   SwVolumeStarted = now;
+
+   MqlRates rates[];
+   ArraySetAsSeries(rates, true);
+   if(CopyRates(_Symbol, _Period, 0, InpVolumeBars, rates) != InpVolumeBars)
+   {
+      SwVolumeUnavailable("n/d (bougies)");
+      return;
+   }
+   MqlTick last;
+   if(!SymbolInfoTick(_Symbol, last) || last.time_msc < (long)rates[0].time * 1000)
+   {
+      SwVolumeUnavailable("n/d (heure du symbole)", GetLastError());
+      return;
+   }
+   bool hasVolume = false;
+   for(int bar = 0; bar < InpVolumeBars; ++bar)
+      if(rates[bar].real_volume > 0)
+         hasVolume = true;
+   if(!hasVolume)
+   {
+      SwVolumeUnavailable("n/d (volume reel)");
+      return;
+   }
+
+   SwVolumeMinPrice = DBL_MAX;
+   SwVolumeMaxPrice = -DBL_MAX;
+   if(!SwScanVolumeBars(rates, (ulong)last.time_msc, 0))
+      return;
+   if(SwVolumeMinPrice == DBL_MAX || SwVolumeMaxPrice < SwVolumeMinPrice)
+   {
+      SwVolumeUnavailable("n/d (transactions)");
+      return;
+   }
+   if(ArrayResize(SwVolumeBins, InpVolumeBins) != InpVolumeBins)
+   {
+      SwVolumeUnavailable("n/d (memoire)", GetLastError());
+      return;
+   }
+   ArrayInitialize(SwVolumeBins, 0.0);
+   if(!SwScanVolumeBars(rates, (ulong)last.time_msc, 1))
+      return;
+
+   MqlRates check[];
+   ArraySetAsSeries(check, true);
+   if(CopyRates(_Symbol, _Period, 0, InpVolumeBars, check) != InpVolumeBars)
+   {
+      SwVolumeUnavailable("n/d (bougies)");
+      return;
+   }
+   for(int bar = 0; bar < InpVolumeBars; ++bar)
+      if(check[bar].time != rates[bar].time || check[bar].real_volume != rates[bar].real_volume)
+      {
+         SwVolumeUnavailable("n/d (mise a jour)");
+         return;
+      }
+
+   SwVolumeBounds bounds;
+   if(!SwProfileBounds(SwVolumeBins, InpVolumeValueAreaPercent / 100.0, bounds))
+   {
+      SwVolumeUnavailable("n/d (profil invalide)");
+      return;
+   }
+   double step = (SwVolumeMaxPrice - SwVolumeMinPrice) / InpVolumeBins;
+   SwVolumePoc = NormalizeDouble(SwVolumeMinPrice + (bounds.poc + 0.5) * step, _Digits);
+   SwVolumeVal = NormalizeDouble(SwVolumeMinPrice + bounds.lower * step, _Digits);
+   SwVolumeVah = NormalizeDouble(SwVolumeMinPrice + (bounds.upper + 1) * step, _Digits);
+   SwVolumeMessage = "";
+   SwVolumeLastError = "";
+}
+
+
 void SwRefreshInfo()
 {
    SwLatestRsi = "n/d";
    SwLatestDivergence = "n/d";
    SwLatestDiv7 = "n/d";
    SwLatestDiv14 = "n/d";
-   SwLatestTrend = "n/d";
+   SwCurrentTrend = SwTrendAt(1);
    int shift = iBarShift(_Symbol, _Period, LatestSignalTime, true);
    if(LatestSignalTime <= 0 || shift < 1)
       return;
@@ -446,7 +707,6 @@ void SwRefreshInfo()
       return;
    SwLatestRsi = SwRsiAt(at);
    SwLatestDivergence = SwDivergenceAt(at, SwLatestDiv7, SwLatestDiv14);
-   SwLatestTrend = SwTrendAt(SwLastClosedShift((ENUM_TIMEFRAMES)_Period, at));
 }
 
 bool RefreshChartZones()
@@ -1531,7 +1791,11 @@ int TableFieldForRow(const int row)
 {
    if(row == 4) return 12;
    if(row == 5) return 11;
-   return row > 5 ? row - 3 : row - 1;
+   if(row == 6) return 10;
+   if(row == 7) return 13;
+   if(row == 8) return 14;
+   if(row == 9) return 15;
+   return row > 9 ? row - 7 : row - 1;
 }
 
 int TableColumnWidth(const int section, const int column)
@@ -1615,6 +1879,9 @@ string TableLabelCellText(const int field)
    if(field == 10) return "TENDANCE EMA";
    if(field == 11) return "INTERPRETATION";
    if(field == 12) return "ETAT";
+   if(field == 13) return "VOLUMES / POC";
+   if(field == 14) return "VOLUMES / VAH";
+   if(field == 15) return "VOLUMES / VAL";
    return "";
 }
 
@@ -1795,6 +2062,10 @@ string TableCellText(const int section, const int row, const int column)
       return column == 0 ? "SIGNAL" : "DERNIER";
    int field = TableFieldForRow(row);
    if(column == 0) return TableLabelCellText(field);
+   if(field == 10) return SwCurrentTrend;
+   if(field == 13) return SwVolumePoc == EMPTY_VALUE ? SwVolumeMessage : PriceText(SwVolumePoc);
+   if(field == 14) return PriceText(SwVolumeVah);
+   if(field == 15) return PriceText(SwVolumeVal);
    if(LatestSignalTime == 0) return "--";
    if(field == 0) return TimeToString(LatestSignalTime, TIME_DATE | TIME_MINUTES);
    if(field == 1) return ShortPatternName(LatestSignalName);
@@ -1806,7 +2077,6 @@ string TableCellText(const int section, const int row, const int column)
    if(field == 7) return TakeProfitText(2);
    if(field == 8) return SwLatestRsi;
    if(field == 9) return SwLatestDivergence;
-   if(field == 10) return SwLatestTrend;
    if(field == 11) return SwInterpretation(LatestSignalDirection, SwLatestDiv7, SwLatestDiv14);
    if(field == 12) return LatestSignalStatus;
    return "";
@@ -1873,11 +2143,12 @@ void MeasureTableMetrics()
    for(int field = 0; field < FieldCount; ++field)
       if(TextGetSize(TableLabelCellText(field), width, height) && (int)width > labelWidth)
          labelWidth = (int)width;
-   string samples[5] = {"Harami Cross / Étoile filante",
+   string samples[6] = {"Harami Cross / Étoile filante",
                         "SURACHAT (100.0 / 100.0)", "1234567.89 (12.34 R)",
-                        "1234567.89 USD", "7:HAUSS. (partiel) 14:BAISS. (partiel)"};
+                        "1234567.89 USD", "7:HAUSS. (partiel) 14:BAISS. (partiel)",
+                        "n/d (donnees incompletes)"};
    int valueWidth = 0;
-   for(int index = 0; index < 5; ++index)
+   for(int index = 0; index < 6; ++index)
       if(TextGetSize(samples[index], width, height) && (int)width > valueWidth)
          valueWidth = (int)width;
    if(labelWidth > 0) TableLabelColumnWidth = labelWidth + 2 * TableTextPaddingX;
@@ -2119,6 +2390,10 @@ int OnInit()
    }
    if(InpWickBodyRatio <= 0.0 || InpArrowOffsetPoints < 0
       || InpMaxBarsToScan < 1
+      || InpVolumeBars < 1 || InpVolumeBars > 5000
+      || InpVolumeBins < 1 || InpVolumeBins > 500
+      || !MathIsValidNumber(InpVolumeValueAreaPercent)
+      || InpVolumeValueAreaPercent <= 0.0 || InpVolumeValueAreaPercent > 100.0
       || InpSwingLookbackBars < 1
       || InpPinSwingLookbackBars < 1 || InpPinSwingLookbackM5 < 1
       || InpPinSwingLookbackM15 < 1 || InpPinSwingLookbackM30 < 1
@@ -3216,5 +3491,6 @@ color ToolColor(const int index)
 void OnTimer()
 {
    SwRefreshInfo();
+   SwUpdateVolumeProfile();
    if(InpShowTable) UpdateSignalTable();
 }

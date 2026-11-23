@@ -17,6 +17,17 @@ Au chargement ou après une modification de zone, les signaux sont recalculés s
 
 La rubrique **INTERPRETATION** compare le sens du signal aux divergences RSI 7 et 14 à la confirmation : concordante si elles vont dans le sens du signal, opposée si elles vont dans le sens contraire, mixte si les deux sens sont présents, aucune s'il n'y a pas de divergence, et `n/d` si les données nécessaires manquent. Un résultat marqué `partiel` repose sur des données incomplètes ; il ne signifie pas que l'autre sens est absent.
 
+## Tendance et volumes
+
+**TENDANCE EMA** est informative et indépendante du signal. Elle compare les EMA 50, 100 et 200 sur la dernière bougie clôturée du TF affiché : haussière si EMA 50 > EMA 100 > EMA 200, baissière dans l'ordre inverse, et indécise sinon. Les données insuffisantes sont indiquées par `n/d`.
+
+**VOLUMES** présente un profil des volumes exécutés par prix sur les 100 dernières bougies du TF, bougie courante incluse. Le nombre de bougies, les 50 gammes de prix et la zone de valeur à 70 % sont modifiables dans les paramètres. Le profil est actualisé par le timer, au plus une fois toutes les cinq secondes.
+
+- **POC** : milieu de la gamme ayant le plus grand volume exécuté.
+- **VAH / VAL** : limites haute et basse de la zone de valeur. À partir du POC, les gammes adjacentes les plus volumineuses sont ajoutées jusqu'à atteindre le pourcentage demandé ; à égalité, la gamme basse est choisie.
+
+Ce profil utilise l'historique des transactions fourni par le courtier, pas les volumes de ticks ni le carnet d'ordres en attente. Il exige des ticks identifiés comme transactions avec leur prix et leur volume, et vérifie leur somme contre le volume réel de chaque bougie. Si ces données manquent, sont incomplètes ou changent pendant le calcul, il affiche `n/d` ; aucun volume de remplacement n'est inventé. Le calcul est limité à un million de ticks, y compris les cotations, par passe et à une seconde par tentative ; au-delà, la limite atteinte est indiquée. Cette limitation ou l'absence de volumes exécutés peut notamment concerner le Forex et les indices synthétiques.
+
 Les anciennes rubriques Actions, Sweep du jour et Taux de réussite ainsi que le suivi statistique associé ont été retirés. Les fichiers statistiques déjà présents dans le dossier de données MT5 ne sont pas supprimés.
 
 ## Installation
@@ -30,4 +41,4 @@ Configurez les alertes et, pour le Forex, le décalage GMT du serveur du broker 
 
 ## Vérification
 
-Avec Node.js, `node tests\indicator-logic.test.js` vérifie les cas de statut, sortie et interprétation communs aux deux indicateurs. Ce test ne remplace ni la compilation dans MetaEditor ni la vérification sur un graphique MT5.
+Avec Node.js, `node tests\indicator-logic.test.js` et `node tests\volume-profile.test.js` vérifient les cas de signal, de tendance et de profil de volumes communs aux deux indicateurs. Ces tests ne remplacent ni la compilation dans MetaEditor ni la vérification sur un graphique MT5.
