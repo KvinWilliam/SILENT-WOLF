@@ -70,7 +70,7 @@ input int    InpPinSwingLookbackM5   = 36;        // M5 : nombre de bougies
 input int    InpPinSwingLookbackM15  = 12;        // M15 : nombre de bougies
 input int    InpPinSwingLookbackM30  = 6;         // M30 : nombre de bougies
 input int    InpPinSwingLookbackH1   = 6;         // H1 : nombre de bougies
-input int    InpMaxBarsToScan        = 20000;     // Maximum confirmation bars to scan
+input int    InpMaxBarsToScan        = 20000;     // Barres rescannées après le calcul initial
 input string InpBullishZonePrefix    = "Zone_Haussière_"; // Préfixe des zones d'achat
 input string InpBearishZonePrefix    = "Zone_Baissière_"; // Préfixe des zones de vente
 input bool   InpExtendZonesRight     = true;      // Zone active après son bord droit
@@ -138,6 +138,7 @@ bool PositionStateInitialized = false;
 int ActiveSignalDirection = 0;
 datetime ActiveSignalTime = 0;
 datetime LatestSignalTime = 0;
+string LatestSignalStatus = "--";
 double LatestEntry1Price = 0.0;
 double LatestEntry1Risk = EMPTY_VALUE;
 int LatestSignalDirection = 0;
@@ -165,7 +166,7 @@ bool ChartEventCreateForced = false;       // P5
 bool ChartEventDeleteForced = false;       // P5
 
 // C12: field indexes determine panel rows and colorization.
-const int FieldCount     = 12;
+const int FieldCount     = 13;
 double LatestSignalAdr = EMPTY_VALUE;
 ENUM_REJECTION_REASON CandidateRejection = REJECT_NONE;
 bool CandidatePatternFound = false;
@@ -1528,8 +1529,9 @@ int TableSectionRowCount()
 
 int TableFieldForRow(const int row)
 {
-   if(row == 4) return 11;
-   return row > 4 ? row - 2 : row - 1;
+   if(row == 4) return 12;
+   if(row == 5) return 11;
+   return row > 5 ? row - 3 : row - 1;
 }
 
 int TableColumnWidth(const int section, const int column)
@@ -1612,6 +1614,7 @@ string TableLabelCellText(const int field)
    if(field == 9) return "DIVERGENCE RSI";
    if(field == 10) return "TENDANCE EMA";
    if(field == 11) return "INTERPRETATION";
+   if(field == 12) return "ETAT";
    return "";
 }
 
@@ -1779,10 +1782,17 @@ bool HasOppositeExit(const int signalIndex, const int direction, const int rates
    return false;
 }
 
+int DisplayedSignalIndex(const int latestIndex, const int previousShift, const int scanLimit)
+{
+   if(latestIndex < 0 && previousShift > scanLimit)
+      return previousShift;
+   return latestIndex;
+}
+
 string TableCellText(const int section, const int row, const int column)
 {
    if(row == 0)
-      return column == 0 ? "SIGNAL" : "EN COURS";
+      return column == 0 ? "SIGNAL" : "DERNIER";
    int field = TableFieldForRow(row);
    if(column == 0) return TableLabelCellText(field);
    if(LatestSignalTime == 0) return "--";
@@ -1798,6 +1808,7 @@ string TableCellText(const int section, const int row, const int column)
    if(field == 9) return SwLatestDivergence;
    if(field == 10) return SwLatestTrend;
    if(field == 11) return SwInterpretation(LatestSignalDirection, SwLatestDiv7, SwLatestDiv14);
+   if(field == 12) return LatestSignalStatus;
    return "";
 }
 
@@ -2264,10 +2275,23 @@ int OnCalculate(const int rates_total, const int prev_calculated,
    if(!recalculateSignals && LatestSignalTime > 0)
    {
       int shift = iBarShift(_Symbol, _Period, LatestSignalTime, true);
-      if(shift < 1 || !SignalIsActive(SignalStatus(shift, LatestSignalDirection,
-                                                   LatestEntry1Price, LatestStopPrice,
-                                                   LatestSignalAdr, high, low)))
+      if(shift < 1)
          recalculateSignals = true;
+      else if(LatestSignalStatus != "SORTIE CONTRAIRE")
+      {
+         string status = SignalStatus(shift, LatestSignalDirection, LatestEntry1Price,
+                                      LatestStopPrice, LatestSignalAdr, high, low);
+         if(status != LatestSignalStatus)
+         {
+            LatestSignalStatus = status;
+            if(!SignalIsActive(status) && ActiveSignalTime == LatestSignalTime)
+            {
+               ActiveSignalDirection = 0;
+               ActiveSignalTime = 0;
+            }
+            if(InpShowTable) UpdateSignalTable();
+         }
+      }
    }
    if(!recalculateSignals)
       return rates_total;
@@ -2285,7 +2309,16 @@ int OnCalculate(const int rates_total, const int prev_calculated,
    if(InpAlertOnZoneChange && fullRecalculation)
       EntryAlertArmedBarTime = time[1];
 
-   int oldestSignalIndex = MathMin(rates_total - 2, InpMaxBarsToScan);
+   int oldestSignalIndex = fullRecalculation ? rates_total - 2
+                                            : MathMin(rates_total - 2, InpMaxBarsToScan);
+   int previousShift = LatestSignalTime > 0
+                       ? iBarShift(_Symbol, _Period, LatestSignalTime, true) : -1;
+   datetime previousTime = LatestSignalTime;
+   int previousDirection = LatestSignalDirection;
+   string previousName = LatestSignalName;
+   double previousEntry = LatestEntry1Price;
+   double previousRisk = LatestEntry1Risk;
+   double previousStop = LatestStopPrice;
 
    if(fullRecalculation)
    {
@@ -2301,7 +2334,12 @@ int OnCalculate(const int rates_total, const int prev_calculated,
    }
    else
    {
-      // C11 : toute la plage rescannée est nettoyée avant le rescan.
+      // Effacer aussi la flèche précédente si elle est hors de la plage rescannée.
+      if(previousShift >= 0 && previousShift < rates_total)
+      {
+         BullishBuffer[previousShift] = EMPTY_VALUE;
+         BearishBuffer[previousShift] = EMPTY_VALUE;
+      }
       int clearUpperBound = MathMin(rates_total - 1, oldestSignalIndex + 1);
       for(int index = 0; index <= clearUpperBound; ++index)
       {
@@ -2323,6 +2361,7 @@ int OnCalculate(const int rates_total, const int prev_calculated,
    SignalsDirty = false;
    IndicatorDataPending = false;
    LatestSignalTime = 0;
+   LatestSignalStatus = "--";
    LatestEntry1Price = 0.0;
    LatestEntry1Risk = EMPTY_VALUE;
    LatestSignalDirection = 0;
@@ -2348,6 +2387,8 @@ int OnCalculate(const int rates_total, const int prev_calculated,
    int currentBarEntryPatternIndex = -1;
    bool trackedSignalFound = false;
    bool trackedSignalActive = false;
+   datetime latestActiveTime = 0;
+   int latestActiveDirection = 0;
 
    for(int i = oldestSignalIndex; i >= 1; --i)
    {
@@ -2421,21 +2462,27 @@ int OnCalculate(const int rates_total, const int prev_calculated,
                           ? EMPTY_VALUE : EstimateLoss(entry1, stopPrice, direction);
 
       int maxAge = EffectiveMaxSignalAgeBars();
-      if(maxAge > 0 && i - 1 > maxAge)
-         continue;
-      double candidateAdr = EMPTY_VALUE;
-      ENUM_INDICATOR_READ candidateAdrRead = AdrAtSignal(time[i - 1], candidateAdr);
-      if(candidateAdrRead == INDICATOR_READ_PENDING && i == 1)
-         ReportDataIssue("ADR du signal courant");
-      string candidateStatus = SignalStatus(i, direction, entry1, stopPrice, candidateAdr, high, low);
-      if(time[i] == ActiveSignalTime && direction == ActiveSignalDirection)
+      bool trackCandidate = time[i] == ActiveSignalTime && direction == ActiveSignalDirection;
+      bool initializeCandidate = !PositionStateInitialized
+                                 && (maxAge <= 0 || i - 1 <= maxAge);
+      if(trackCandidate || initializeCandidate)
       {
-         trackedSignalFound = true;
-         trackedSignalActive = SignalIsActive(candidateStatus);
+         double candidateAdr = EMPTY_VALUE;
+         AdrAtSignal(time[i - 1], candidateAdr);
+         string candidateStatus = SignalStatus(i, direction, entry1, stopPrice,
+                                               candidateAdr, high, low);
+         if(trackCandidate)
+         {
+            trackedSignalFound = true;
+            trackedSignalActive = SignalIsActive(candidateStatus);
+         }
+         if(initializeCandidate && SignalIsActive(candidateStatus)
+            && !HasOppositeExit(i, direction, rates_total, time, open, high, low, close))
+         {
+            latestActiveTime = time[i];
+            latestActiveDirection = direction;
+         }
       }
-      if(!SignalIsActive(candidateStatus)
-         || HasOppositeExit(i, direction, rates_total, time, open, high, low, close))
-         continue;
 
       latestSignalIndex = i;
       LatestSignalTime = time[i];
@@ -2444,7 +2491,37 @@ int OnCalculate(const int rates_total, const int prev_calculated,
       LatestSignalDirection = direction;
       LatestSignalName = patternName;
       LatestStopPrice = stopPrice;
-      LatestSignalAdr = candidateAdr;
+   }
+
+   int displayedIndex = DisplayedSignalIndex(latestSignalIndex, previousShift, oldestSignalIndex);
+   if(displayedIndex != latestSignalIndex)
+   {
+      latestSignalIndex = displayedIndex;
+      LatestSignalTime = previousTime;
+      LatestSignalDirection = previousDirection;
+      LatestSignalName = previousName;
+      LatestEntry1Price = previousEntry;
+      LatestEntry1Risk = previousRisk;
+      LatestStopPrice = previousStop;
+   }
+   if(latestSignalIndex >= 1)
+   {
+      ENUM_INDICATOR_READ adrRead = AdrAtSignal(time[latestSignalIndex - 1], LatestSignalAdr);
+      if(adrRead == INDICATOR_READ_PENDING)
+         ReportDataIssue("ADR du dernier signal");
+      LatestSignalStatus = SignalStatus(latestSignalIndex, LatestSignalDirection,
+                                        LatestEntry1Price, LatestStopPrice,
+                                        LatestSignalAdr, high, low);
+      if(SignalIsActive(LatestSignalStatus)
+         && HasOppositeExit(latestSignalIndex, LatestSignalDirection, rates_total,
+                            time, open, high, low, close))
+         LatestSignalStatus = "SORTIE CONTRAIRE";
+      if(previousShift > oldestSignalIndex && ActiveSignalTime == LatestSignalTime
+         && ActiveSignalDirection == LatestSignalDirection)
+      {
+         trackedSignalFound = true;
+         trackedSignalActive = SignalIsActive(LatestSignalStatus);
+      }
    }
 
    if(fullRecalculation)
@@ -2463,11 +2540,8 @@ int OnCalculate(const int rates_total, const int prev_calculated,
 
    if(!PositionStateInitialized)
    {
-      if(latestSignalIndex >= 0)
-      {
-         ActiveSignalDirection = LatestSignalDirection;
-         ActiveSignalTime = LatestSignalTime;
-      }
+      ActiveSignalDirection = latestActiveDirection;
+      ActiveSignalTime = latestActiveTime;
       PositionStateInitialized = true;
    }
 
@@ -2540,8 +2614,16 @@ int OnCalculate(const int rates_total, const int prev_calculated,
       // A7 : libellé dirigé pour l'inside bar dans le message d'alerte.
       string patternLabel = SignalDisplayName(patternName, direction);
       string side = direction > 0 ? "achat" : "vente";
-      ActiveSignalDirection = LatestSignalDirection;
-      ActiveSignalTime = LatestSignalTime;
+      if(LatestSignalTime == time[confirmationIndex] && SignalIsActive(LatestSignalStatus))
+      {
+         ActiveSignalDirection = LatestSignalDirection;
+         ActiveSignalTime = LatestSignalTime;
+      }
+      else
+      {
+         ActiveSignalDirection = 0;
+         ActiveSignalTime = 0;
+      }
       double rsi7 = EMPTY_VALUE, rsi14 = EMPTY_VALUE;
       SwRead(SwRsi7[0], currentBarEntryPatternIndex, rsi7);
       SwRead(SwRsi14[0], currentBarEntryPatternIndex, rsi14);
