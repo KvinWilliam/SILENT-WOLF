@@ -29,12 +29,6 @@ enum ENUM_ZONE_MATCH_MODE
    ZONE_DIRECTIONAL_WICK_OVERLAP = 4
 };
 
-enum ENUM_TP_MODE
-{
-   ADR_D1 = 0,
-   MULTIPLE_DE_R = 1
-};
-
 enum ENUM_REJECTION_REASON
 {
    REJECT_NONE = 0,
@@ -120,7 +114,6 @@ input bool   InpIncludeSpreadInRisk  = false;    // C12 : inclure le spread cour
 // n'est volontairement pas imposée comme défaut.
 input double InpZeroBodyFloorRangeFraction = 0.0; // P2 : plancher de corps nul = fraction du range (0 = off)
 input bool   InpShowTable            = true;     // P6 : afficher le panneau de confirmations
-input bool   InpShowPreviousSection  = true;     // P6 : afficher la section PRÉCÉDENT
 // A1 : inside bar activée par défaut avec validation de la pin fusionnée.
 // Définition retenue (convention courante, PAS une norme) : range de la
 // bougie inside entièrement contenu dans celui de la mère. La couleur des
@@ -129,12 +122,7 @@ input bool   InpEnableInsideBar         = true;  // A1 : détecter l'inside bar
 input double InpInsideBarMaxRatio       = 1.0;   // A1 : range inside / range mère maximum
 input bool   InpInsideBarRequireFusedPin = true;  // Sortie : exiger la forme fusionnée (toujours exigée en entrée)
 input bool   InpInsideBarUseForExit     = false; // A6 : inside bar admise en alerte de SORTIE
-// B4 : auto-compaction. Défaut true : si le panneau à deux sections ne tient
-// pas dans la hauteur utile du graphique (moins des marges), la section
-// PRÉCÉDENT est masquée pour ce rendu ; l'input utilisateur n'est PAS modifié.
-// CHANGEMENT DE COMPORTEMENT DÉCLARÉ : sur un graphique trop bas, PRÉCÉDENT
-// est désormais masquée alors qu'elle était auparavant tracée (et débordait).
-input bool   InpAutoCompactTable        = true;  // B4 : masquer PRÉCÉDENT si le panneau déborde
+input bool   InpAutoCompactTable        = true;  // Adapter le nombre de lignes à la hauteur du graphique
 // C-R1 : false (défaut) = alerte d'ENTRÉE uniquement à l'ouverture de barre
 // (avec rattrapage si des données d'indicateur manquaient alors). true =
 // une modification de zone en cours de barre peut aussi émettre l'alerte
@@ -173,23 +161,11 @@ bool PositionStateInitialized = false;
 int ActiveSignalDirection = 0;
 datetime ActiveSignalTime = 0;
 datetime LatestSignalTime = 0;
-datetime PreviousSignalTime = 0;
 double LatestEntry1Price = 0.0;
-double PreviousEntry1Price = 0.0;
 double LatestEntry1Risk = EMPTY_VALUE;
-double PreviousEntry1Risk = EMPTY_VALUE;
-double LatestRsi7 = EMPTY_VALUE;
-double PreviousRsi7 = EMPTY_VALUE;
-double LatestRsi14 = EMPTY_VALUE;
-double PreviousRsi14 = EMPTY_VALUE;
 int LatestSignalDirection = 0;
-int PreviousSignalDirection = 0;
-bool LatestRsiStrengthened = false;
-bool PreviousRsiStrengthened = false;
 string LatestSignalName = "";
-string PreviousSignalName = "";
 double LatestStopPrice = EMPTY_VALUE;      // C12
-double PreviousStopPrice = EMPTY_VALUE;    // C12
 bool PendingNewBarAlert = false;           // C8
 bool IndicatorDataPending = false;         // C10
 int DataRetryCount = 0;                    // C10
@@ -212,16 +188,8 @@ bool ChartEventCreateForced = false;       // P5
 bool ChartEventDeleteForced = false;       // P5
 
 // C12: field indexes determine panel rows and colorization.
-const int FieldCount     = 14;
-double CurrentAdr = EMPTY_VALUE;
+const int FieldCount     = 12;
 double LatestSignalAdr = EMPTY_VALUE;
-double PreviousSignalAdr = EMPTY_VALUE;
-int LatestAge = 0;
-int PreviousAge = 0;
-string LatestStatus = "--";
-string PreviousStatus = "--";
-int LatestPatternIndex = -1;
-int PreviousPatternIndex = -1;
 ENUM_REJECTION_REASON CandidateRejection = REJECT_NONE;
 bool CandidatePatternFound = false;
 int RejectedByReason[8];
@@ -291,42 +259,15 @@ void ReportDataIssue(const string context)
    }
 }
 
-// SilentWolf: contexte informatif et statistiques prospectives.
-struct SwRecord
-{
-   datetime signalTime;
-   datetime startTime;
-   long startMsc;
-   datetime checkedThrough;
-   int direction;
-   double entry;
-   double stop;
-   double target;
-   int targetMode;
-   int adrPeriod;
-   double targetMultiple;
-   int result; // 0 en cours, 1 gain, -1 perte, 2 indetermine
-   bool retryTicks;
-};
-
-SwRecord SwRecords[];
-bool SwStatsReady = false;
-bool SwStatsDirty = false;
-int SwStatsLock = INVALID_HANDLE;
+// SilentWolf: contexte informatif sur le TF du graphique.
 int SwRsi7[1] = {INVALID_HANDLE};
 int SwRsi14[1] = {INVALID_HANDLE};
 int SwEma[3] = {INVALID_HANDLE, INVALID_HANDLE, INVALID_HANDLE};
 string SwLatestRsi;
-string SwPreviousRsi;
 string SwLatestDivergence = "n/d";
 string SwLatestDiv7 = "n/d";
 string SwLatestDiv14 = "n/d";
-string SwPreviousDivergence = "n/d";
 string SwLatestTrend = "n/d";
-string SwPreviousTrend = "n/d";
-string SwSweep = "n/d";
-datetime SwLastStatisticsCheck = 0;
-datetime SwNextStatisticsRetry = 0;
 
 string SwTimeframeName()
 {
@@ -337,11 +278,6 @@ string SwTimeframeName()
 
 void SwReleaseHandles()
 {
-   if(SwStatsLock != INVALID_HANDLE)
-   {
-      FileClose(SwStatsLock);
-      SwStatsLock = INVALID_HANDLE;
-   }
    if(SwRsi7[0] != INVALID_HANDLE) IndicatorRelease(SwRsi7[0]);
    if(SwRsi14[0] != INVALID_HANDLE) IndicatorRelease(SwRsi14[0]);
    SwRsi7[0] = INVALID_HANDLE;
@@ -517,447 +453,23 @@ string SwTrendAt(const int shift)
    return "INDECISE";
 }
 
-string SwSweepToday(const int ratesTotal, const datetime &times[],
-                    const double &high[], const double &low[], const double &close[])
-{
-   if(PeriodSeconds(_Period) >= PeriodSeconds(PERIOD_D1)) return "n/d (UT)";
-   datetime day = iTime(_Symbol, PERIOD_D1, 0);
-   MqlRates previous[1];
-   if(day <= 0 || CopyRates(_Symbol, PERIOD_D1, 1, 1, previous) != 1) return "n/d";
-   if(ratesTotal < 1 || times[0] < day) return "n/d";
-   int oldest = iBarShift(_Symbol, _Period, day, false);
-   if(oldest < 0 || oldest >= ratesTotal) return "n/d";
-   for(int i = 1; i <= oldest; ++i)
-   {
-      if(times[i] < day) break;
-      bool top = high[i] > previous[0].high && close[i] < previous[0].high;
-      bool bottom = low[i] < previous[0].low && close[i] > previous[0].low;
-      if(top && bottom) return "PDH et PDL (ordre n/d)";
-      if(top) return "PDH " + TimeToString(times[i], TIME_MINUTES);
-      if(bottom) return "PDL " + TimeToString(times[i], TIME_MINUTES);
-   }
-   return "Aucun";
-}
-
-string SwSafeFilename(string value)
-{
-   StringReplace(value, "\\", "_");
-   StringReplace(value, "/", "_");
-   StringReplace(value, ":", "_");
-   StringReplace(value, "*", "_");
-   StringReplace(value, "?", "_");
-   StringReplace(value, "\"", "_");
-   StringReplace(value, "<", "_");
-   StringReplace(value, ">", "_");
-   StringReplace(value, "|", "_");
-   return value;
-}
-
-string SwStatsFile()
-{
-   return "SilentWolf_" + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN))
-          + "_" + SwSafeFilename(AccountInfoString(ACCOUNT_SERVER))
-          + "_" + SwSafeFilename(_Symbol) + "_" + IntegerToString((int)_Period) + ".csv";
-}
-
-bool SwSaveStats()
-{
-   if(!SwStatsReady) return false;
-   string file = SwStatsFile();
-   string temp = file + ".tmp";
-   int handle = FileOpen(temp, FILE_WRITE | FILE_CSV | FILE_ANSI, ';');
-   if(handle == INVALID_HANDLE)
-   {
-      Print("SilentWolf : impossible d'enregistrer les statistiques, erreur ", GetLastError());
-      return false;
-   }
-   bool ok = FileWrite(handle, "SilentWolf", "3", _Symbol, (int)_Period,
-                       AccountInfoInteger(ACCOUNT_LOGIN)) > 0;
-   for(int i = 0; ok && i < ArraySize(SwRecords); ++i)
-   {
-      SwRecord r = SwRecords[i];
-      ok = FileWrite(handle, (long)r.signalTime, (long)r.startTime, r.startMsc,
-                     (long)r.checkedThrough, r.direction,
-                     DoubleToString(r.entry, _Digits),
-                     DoubleToString(r.stop, _Digits),
-                     DoubleToString(r.target, _Digits), r.targetMode, r.adrPeriod,
-                     DoubleToString(r.targetMultiple, 8), r.result, (int)r.retryTicks) > 0;
-   }
-   FileFlush(handle);
-   FileClose(handle);
-   if(!ok || !FileMove(temp, 0, file, FILE_REWRITE))
-   {
-      Print("SilentWolf : ecriture des statistiques impossible, erreur ", GetLastError());
-      return false;
-   }
-   SwStatsDirty = false;
-   return true;
-}
-
-bool SwLoadStats()
-{
-   ArrayResize(SwRecords, 0);
-   string file = SwStatsFile();
-   SwStatsLock = FileOpen(file + ".lock", FILE_READ | FILE_WRITE | FILE_BIN);
-   if(SwStatsLock == INVALID_HANDLE)
-   {
-      Print("SilentWolf : statistiques verrouillees par une autre instance ou fichier inaccessible, erreur ",
-            GetLastError());
-      return false;
-   }
-   if(!FileIsExist(file))
-   {
-      SwStatsReady = true;
-      return true;
-   }
-   int handle = FileOpen(file, FILE_READ | FILE_CSV | FILE_ANSI, ';');
-   if(handle == INVALID_HANDLE)
-   {
-      Print("SilentWolf : lecture des statistiques impossible, erreur ", GetLastError());
-      return false;
-   }
-   string magic = FileReadString(handle);
-   string version = FileReadString(handle);
-   string symbol = FileReadString(handle);
-   int period = (int)StringToInteger(FileReadString(handle));
-   long login = StringToInteger(FileReadString(handle));
-   if(magic != "SilentWolf" || version != "3" || symbol != _Symbol
-      || period != (int)_Period || login != AccountInfoInteger(ACCOUNT_LOGIN))
-   {
-      Print("SilentWolf : fichier de statistiques invalide; aucun ecrasement.");
-      FileClose(handle);
-      return false;
-   }
-   while(!FileIsEnding(handle))
-   {
-      string signal = FileReadString(handle);
-      if(signal == "" && FileIsEnding(handle)) break;
-      SwRecord r;
-      r.signalTime = (datetime)StringToInteger(signal);
-      r.startTime = (datetime)StringToInteger(FileReadString(handle));
-      r.startMsc = StringToInteger(FileReadString(handle));
-      r.checkedThrough = (datetime)StringToInteger(FileReadString(handle));
-      r.direction = (int)StringToInteger(FileReadString(handle));
-      r.entry = StringToDouble(FileReadString(handle));
-      r.stop = StringToDouble(FileReadString(handle));
-      r.target = StringToDouble(FileReadString(handle));
-      r.targetMode = (int)StringToInteger(FileReadString(handle));
-      r.adrPeriod = (int)StringToInteger(FileReadString(handle));
-      r.targetMultiple = StringToDouble(FileReadString(handle));
-      r.result = (int)StringToInteger(FileReadString(handle));
-      r.retryTicks = (bool)StringToInteger(FileReadString(handle));
-      if(r.signalTime <= 0 || r.startTime <= 0 || r.startMsc <= 0
-         || (r.direction != 1 && r.direction != -1)
-         || r.entry <= 0 || r.stop <= 0 || r.target < 0
-         || (r.targetMode != ADR_D1 && r.targetMode != MULTIPLE_DE_R)
-         || r.adrPeriod <= 0 || r.targetMultiple <= 0
-         || (r.result != 0 && r.result != 1 && r.result != -1 && r.result != 2))
-      {
-         Print("SilentWolf : ligne de statistiques invalide; aucun ecrasement.");
-         FileClose(handle);
-         ArrayResize(SwRecords, 0);
-         return false;
-      }
-      int size = ArraySize(SwRecords);
-      if(ArrayResize(SwRecords, size + 1) != size + 1)
-      {
-         Print("SilentWolf : memoire insuffisante pour les statistiques.");
-         FileClose(handle);
-         return false;
-      }
-      SwRecords[size] = r;
-   }
-   FileClose(handle);
-   SwStatsReady = true;
-   return true;
-}
-
-bool SwCalculateRecordedTarget(SwRecord &r, const int number = 1)
-{
-   double distance = MathAbs(r.entry - r.stop);
-   if(r.direction * (r.entry - r.stop) <= 0 || distance <= 0)
-      return false;
-   if(r.targetMode == ADR_D1)
-   {
-      int day = iBarShift(_Symbol, PERIOD_D1, r.startTime, false);
-      if(day < 0) return false;
-      MqlRates days[];
-      if(CopyRates(_Symbol, PERIOD_D1, day + 1, r.adrPeriod, days) != r.adrPeriod)
-         return false;
-      double sum = 0;
-      for(int k = 0; k < r.adrPeriod; ++k)
-      {
-         double range = days[k].high - days[k].low;
-         if(range <= 0 || !MathIsValidNumber(range)) return false;
-         sum += range;
-      }
-      distance = sum / r.adrPeriod * (number == 1 ? 1.0 : 3.0);
-   }
-   else
-      distance *= r.targetMultiple;
-   double tick = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-   if(tick <= 0 || !MathIsValidNumber(tick)) return false;
-   double target = NormalizeDouble(MathRound((r.entry + r.direction * distance) / tick) * tick, _Digits);
-   if(!MathIsValidNumber(target) || target <= 0 || r.direction * (target - r.entry) <= 0)
-      return false;
-   r.target = target;
-   return true;
-}
-
-void SwRegisterSignal(const datetime signalTime, const int direction,
-                      const double entry, const double stop)
-{
-   if(!SwStatsReady) return;
-   for(int i = 0; i < ArraySize(SwRecords); ++i)
-      if(SwRecords[i].signalTime == signalTime && SwRecords[i].direction == direction)
-         return;
-   MqlTick tick;
-   bool preciseTime = SymbolInfoTick(_Symbol, tick) && tick.time_msc > 0;
-   if(!preciseTime)
-   {
-      Print("SilentWolf : heure du tick indisponible, signal statistiquement indetermine, erreur ", GetLastError());
-      tick.time = TimeCurrent();
-      tick.time_msc = (long)tick.time * 1000;
-   }
-   int size = ArraySize(SwRecords);
-   if(ArrayResize(SwRecords, size + 1) != size + 1)
-   {
-      Print("SilentWolf : memoire insuffisante pour enregistrer un signal.");
-      return;
-   }
-   SwRecords[size].signalTime = signalTime;
-   SwRecords[size].startTime = tick.time;
-   SwRecords[size].startMsc = tick.time_msc;
-   SwRecords[size].checkedThrough = 0;
-   SwRecords[size].direction = direction;
-   SwRecords[size].entry = entry;
-   SwRecords[size].stop = stop;
-   SwRecords[size].target = 0;
-   SwRecords[size].targetMode = ADR_D1;
-   SwRecords[size].adrPeriod = InpAdrPeriod;
-   SwRecords[size].targetMultiple = 1.0;
-   SwRecords[size].result = 0;
-   SwRecords[size].retryTicks = false;
-   if(tick.time <= 0)
-   {
-      Print("SilentWolf : signal non enregistre, heure serveur indisponible.");
-      ArrayResize(SwRecords, size);
-      return;
-   }
-   if(!preciseTime || stop == EMPTY_VALUE || !MathIsValidNumber(stop)
-      || direction * (entry - stop) <= 0)
-   {
-      Print("SilentWolf : signal enregistre comme indetermine, heure ou stop indisponible.");
-      SwRecords[size].stop = entry;
-      SwRecords[size].result = 2;
-   }
-   else if(!SwCalculateRecordedTarget(SwRecords[size]))
-      Print("SilentWolf : TP1 en attente de donnees pour le signal ", TimeToString(signalTime));
-   SwStatsDirty = true;
-   if(!SwSaveStats())
-      Print("SilentWolf : signal present en memoire mais non sauvegarde.");
-}
-
-// L'ordre intra-bougie n'est accepte que si les ticks reproduisent ses extremes.
-int SwResolveTicks(const SwRecord &r, const MqlRates &bar, const datetime end)
-{
-   MqlTick ticks[];
-   ulong from = (ulong)bar.time * 1000;
-   ulong to = (ulong)end * 1000 - 1;
-   ResetLastError();
-   int count = CopyTicksRange(_Symbol, ticks, COPY_TICKS_ALL, from, to);
-   int tickError = GetLastError();
-   if(count <= 0 || tickError != 0)
-   {
-      Print("SilentWolf : ticks historiques indisponibles pour ",
-            TimeToString(bar.time), ", erreur ", tickError);
-      return 2;
-   }
-   if(bar.tick_volume > 0 && count < bar.tick_volume)
-      return 2;
-   ENUM_SYMBOL_CHART_MODE chartMode = (ENUM_SYMBOL_CHART_MODE)SymbolInfoInteger(_Symbol, SYMBOL_CHART_MODE);
-   double minPrice = DBL_MAX, maxPrice = -DBL_MAX;
-   int first = 0;
-   long firstMsc = 0;
-   bool sameTimeConflict = false;
-   for(int i = 0; i < count; ++i)
-   {
-      double price = chartMode == SYMBOL_CHART_MODE_LAST ? ticks[i].last : ticks[i].bid;
-      if(price <= 0 || !MathIsValidNumber(price)) continue;
-      minPrice = MathMin(minPrice, price);
-      maxPrice = MathMax(maxPrice, price);
-      if(ticks[i].time_msc < r.startMsc) continue;
-      bool stopHit = r.direction > 0 ? price <= r.stop : price >= r.stop;
-      bool targetHit = r.direction > 0 ? price >= r.target : price <= r.target;
-      if(first == 0 && stopHit != targetHit)
-      {
-         first = stopHit ? -1 : 1;
-         firstMsc = ticks[i].time_msc;
-      }
-      else if(first != 0 && ticks[i].time_msc == firstMsc
-              && ((first == 1 && stopHit) || (first == -1 && targetHit)))
-         sameTimeConflict = true;
-   }
-   double tolerance = MathMax(_Point, SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE)) * 0.5;
-   if(MathAbs(minPrice - bar.low) > tolerance || MathAbs(maxPrice - bar.high) > tolerance)
-      return 2;
-   if(sameTimeConflict) return 3;
-   return first;
-}
-
-void SwUpdateStats(const datetime currentBarTime)
-{
-   if(!SwStatsReady || currentBarTime <= 0) return;
-   if(SwStatsDirty && !SwSaveStats()) return;
-   if(SwNextStatisticsRetry > 0 && TimeLocal() < SwNextStatisticsRetry) return;
-   if(SwLastStatisticsCheck == currentBarTime)
-      return;
-   bool changed = false;
-   bool pendingData = false;
-   for(int i = 0; i < ArraySize(SwRecords); ++i)
-   {
-      if(SwRecords[i].result != 0 && !SwRecords[i].retryTicks) continue;
-      if(SwRecords[i].target <= 0)
-      {
-         if(!SwCalculateRecordedTarget(SwRecords[i]))
-         {
-            pendingData = true;
-            continue;
-         }
-         changed = true;
-      }
-      datetime from = SwRecords[i].checkedThrough > 0
-                      ? SwRecords[i].checkedThrough : SwRecords[i].startTime;
-      if(from >= currentBarTime) continue;
-      int startShift = iBarShift(_Symbol, _Period, from, SwRecords[i].checkedThrough > 0);
-      if(startShift < 0)
-      {
-         Print("SilentWolf : historique de suivi incomplet pour ",
-               TimeToString(SwRecords[i].signalTime));
-         pendingData = true;
-         continue;
-      }
-      MqlRates bars[];
-      datetime firstBar = iTime(_Symbol, _Period, startShift);
-      if(firstBar <= 0)
-      {
-         pendingData = true;
-         continue;
-      }
-      int n = CopyRates(_Symbol, _Period, firstBar, currentBarTime - 1, bars);
-      if(n <= 0)
-      {
-         Print("SilentWolf : bougies de suivi indisponibles, erreur ", GetLastError());
-         pendingData = true;
-         continue;
-      }
-      if(n != startShift || bars[0].time != firstBar
-         || bars[n - 1].time != iTime(_Symbol, _Period, 1))
-      {
-         Print("SilentWolf : historique de suivi incomplet pour ",
-               TimeToString(SwRecords[i].signalTime));
-         pendingData = true;
-         continue;
-      }
-      SwRecords[i].result = 0;
-      SwRecords[i].retryTicks = false;
-      for(int b = 0; b < n; ++b)
-      {
-         bool stopHit = SwRecords[i].direction > 0 ? bars[b].low <= SwRecords[i].stop
-                                                   : bars[b].high >= SwRecords[i].stop;
-         bool tpHit = SwRecords[i].direction > 0 ? bars[b].high >= SwRecords[i].target
-                                                 : bars[b].low <= SwRecords[i].target;
-         bool partial = (long)bars[b].time * 1000 < SwRecords[i].startMsc;
-         if((stopHit && tpHit) || (partial && (stopHit || tpHit)))
-         {
-            datetime end = b + 1 < n ? bars[b + 1].time : currentBarTime;
-            int tickResult = SwResolveTicks(SwRecords[i], bars[b], end);
-            SwRecords[i].result = tickResult == 3 ? 2 : tickResult;
-            if(SwRecords[i].result == 2)
-            {
-               SwRecords[i].retryTicks = tickResult != 3;
-               SwRecords[i].checkedThrough = bars[b].time;
-               if(SwRecords[i].retryTicks) pendingData = true;
-            }
-            else
-               SwRecords[i].retryTicks = false;
-         }
-         else if(stopHit) SwRecords[i].result = -1;
-         else if(tpHit) SwRecords[i].result = 1;
-         if(SwRecords[i].result != 0) break;
-      }
-      if(SwRecords[i].result != 2)
-         SwRecords[i].checkedThrough = currentBarTime;
-      changed = true;
-   }
-   if(changed) SwStatsDirty = true;
-   if(SwStatsDirty && !SwSaveStats())
-      Print("SilentWolf : mise a jour statistique non sauvegardee.");
-   if(!pendingData)
-   {
-      SwLastStatisticsCheck = currentBarTime;
-      SwNextStatisticsRetry = 0;
-   }
-   else
-      SwNextStatisticsRetry = TimeLocal() + 15;
-}
-
-string SwStatisticsText()
-{
-   if(!SwStatsReady) return "n/d (fichier)";
-   int wins = 0, losses = 0, unknown = 0, pending = 0;
-   for(int i = 0; i < ArraySize(SwRecords); ++i)
-   {
-      if(SwRecords[i].result == 1) ++wins;
-      else if(SwRecords[i].result == -1) ++losses;
-      else if(SwRecords[i].result == 2) ++unknown;
-      else ++pending;
-   }
-   if(wins + losses == 0)
-      return StringFormat("n/d (0 resolu, %d indet., %d actif)", unknown, pending);
-   return StringFormat("%.1f%% (%dG/%dP, %d indet., %d actif)",
-                       100.0 * wins / (wins + losses), wins, losses, unknown, pending);
-}
-
-datetime SwSignalTime(const datetime signal, const int direction, const datetime fallback)
-{
-   for(int i = 0; i < ArraySize(SwRecords); ++i)
-      if(SwRecords[i].signalTime == signal && SwRecords[i].direction == direction)
-         return SwRecords[i].startTime;
-   return fallback;
-}
-
 void SwRefreshInfo()
 {
+   SwLatestRsi = "n/d";
+   SwLatestDivergence = "n/d";
    SwLatestDiv7 = "n/d";
    SwLatestDiv14 = "n/d";
-   int latestShift = iBarShift(_Symbol, _Period, LatestSignalTime, true);
-   if(LatestSignalTime > 0 && latestShift >= 1)
-   {
-      datetime at = SwSignalTime(LatestSignalTime, LatestSignalDirection,
-                                 iTime(_Symbol, _Period, latestShift - 1));
-      if(at > 0)
-      {
-         SwLatestRsi = SwRsiAt(at);
-         SwLatestDivergence = SwDivergenceAt(at, SwLatestDiv7, SwLatestDiv14);
-         SwLatestTrend = SwTrendAt(SwLastClosedShift((ENUM_TIMEFRAMES)_Period, at));
-      }
-   }
-   int previousShift = iBarShift(_Symbol, _Period, PreviousSignalTime, true);
-   if(PreviousSignalTime > 0 && previousShift >= 1)
-   {
-      datetime at = SwSignalTime(PreviousSignalTime, PreviousSignalDirection,
-                                 iTime(_Symbol, _Period, previousShift - 1));
-      if(at > 0)
-      {
-         SwPreviousRsi = SwRsiAt(at);
-         string previousDiv7, previousDiv14;
-         SwPreviousDivergence = SwDivergenceAt(at, previousDiv7, previousDiv14);
-         SwPreviousTrend = SwTrendAt(SwLastClosedShift((ENUM_TIMEFRAMES)_Period, at));
-      }
-   }
+   SwLatestTrend = "n/d";
+   int shift = iBarShift(_Symbol, _Period, LatestSignalTime, true);
+   if(LatestSignalTime <= 0 || shift < 1)
+      return;
+   datetime at = iTime(_Symbol, _Period, shift - 1);
+   if(at <= 0)
+      return;
+   SwLatestRsi = SwRsiAt(at);
+   SwLatestDivergence = SwDivergenceAt(at, SwLatestDiv7, SwLatestDiv14);
+   SwLatestTrend = SwTrendAt(SwLastClosedShift((ENUM_TIMEFRAMES)_Period, at));
 }
-
 
 bool RefreshChartZones()
 {
@@ -2010,24 +1522,9 @@ double EstimateLoss(const double entryPrice, const double stopPrice,
 const int TableMaxSections = 2;            // P6 : bornes de nettoyage
 const int TableMaxColumns  = 2;            // P6 : bornes de nettoyage
 
-// B4 : auto-compaction. Nombre de sections RÉELLEMENT affichées. L'input
-// InpShowPreviousSection n'est PAS modifié. F3 : seuil cohérent (en-tête
-// compté une fois, marge basse comptée une fois, au niveau du panneau).
 int TableSectionCount()
 {
-   if(!InpShowPreviousSection)
-      return 1;
-   if(!InpAutoCompactTable)
-      return TableMaxSections;
-   long chartHeight = ChartGetInteger(0, CHART_HEIGHT_IN_PIXELS);
-   if(chartHeight <= 0)
-      return TableMaxSections;
-   int twoSectionsTotal = TableTitleBarHeight
-                          + 2 * TableSectionHeight()
-                          + TableSectionGap + TableBottomMargin;
-   if(twoSectionsTotal + 24 > (int)chartHeight)
-      return 1;
-   return TableMaxSections;
+   return 1;
 }
 
 int TableColumnCount(const int section)
@@ -2054,7 +1551,7 @@ int TableSectionRowCount()
 
 int TableFieldForRow(const int row)
 {
-   if(row == 4) return 13;
+   if(row == 4) return 11;
    return row > 4 ? row - 2 : row - 1;
 }
 
@@ -2134,12 +1631,10 @@ string TableLabelCellText(const int field)
    if(field == 5) return InpIncludeSpreadInRisk ? "RISQUE MIN (spread)" : "RISQUE MIN";
    if(field == 6) return "TP1";
    if(field == 7) return "TP2";
-   if(field == 8) return "TAUX DE REUSSITE";
-   if(field == 9) return "SWEEP DU JOUR";
-   if(field == 10) return "RSI " + SwTimeframeName();
-   if(field == 11) return "DIVERGENCE RSI";
-   if(field == 12) return "TENDANCE EMA";
-   if(field == 13) return "ACTIONS";
+   if(field == 8) return "RSI " + SwTimeframeName();
+   if(field == 9) return "DIVERGENCE RSI";
+   if(field == 10) return "TENDANCE EMA";
+   if(field == 11) return "INTERPRETATION";
    return "";
 }
 
@@ -2221,39 +1716,16 @@ string AdrText(const double value)
    return DoubleToString(value, _Digits);
 }
 
-string TakeProfitText(const bool latest, const int number)
+string TakeProfitText(const int number)
 {
-   double entryPrice = latest ? LatestEntry1Price : PreviousEntry1Price;
-   double stop = latest ? LatestStopPrice : PreviousStopPrice;
-   double adr = latest ? LatestSignalAdr : PreviousSignalAdr;
-   datetime when = latest ? LatestSignalTime : PreviousSignalTime;
-   int direction = latest ? LatestSignalDirection : PreviousSignalDirection;
    double target = EMPTY_VALUE;
-   bool recorded = false;
-   bool legacyTarget = false;
-   for(int i = 0; i < ArraySize(SwRecords); ++i)
-      if(SwRecords[i].signalTime == when && SwRecords[i].direction == direction)
-      {
-         recorded = true;
-         if(number == 1)
-         {
-            if(SwRecords[i].target > 0) target = SwRecords[i].target;
-            legacyTarget = SwRecords[i].targetMode == MULTIPLE_DE_R;
-         }
-         else
-         {
-            SwRecord copy = SwRecords[i];
-            copy.targetMode = ADR_D1;
-            if(SwCalculateRecordedTarget(copy, 2)) target = copy.target;
-         }
-         break;
-      }
-   if((!recorded && !TargetPrice(entryPrice, stop, direction, adr, number, target))
-      || target == EMPTY_VALUE || direction * (entryPrice - stop) <= 0)
+   if(!TargetPrice(LatestEntry1Price, LatestStopPrice, LatestSignalDirection,
+                   LatestSignalAdr, number, target)
+      || LatestSignalDirection * (LatestEntry1Price - LatestStopPrice) <= 0)
       return "n/d";
-   double ratio = direction * (target - entryPrice) / MathAbs(entryPrice - stop);
-   return DoubleToString(target, _Digits) + " (" + DoubleToString(ratio, 2) + " R)"
-          + (legacyTarget ? " ancien mode R" : "");
+   double ratio = LatestSignalDirection * (target - LatestEntry1Price)
+                  / MathAbs(LatestEntry1Price - LatestStopPrice);
+   return DoubleToString(target, _Digits) + " (" + DoubleToString(ratio, 2) + " R)";
 }
 
 // Suivi théorique : les OHLC ne permettent pas de déterminer l'ordre intrabar.
@@ -2269,9 +1741,9 @@ string SignalStatus(const int signalIndex, const int direction, const double ent
    bool hasTp2 = TargetPrice(entry, stop, direction, adr, 2, tp2);
    int maxSignalAgeBars = EffectiveMaxSignalAgeBars();
    bool tp1Reached = false;
-   for(int bar = signalIndex - 1; bar >= 1; --bar)
+   for(int bar = signalIndex - 1; bar >= 0; --bar)
    {
-      int age = signalIndex - bar;
+      int age = signalIndex - bar - (bar == 0 ? 1 : 0);
       if(maxSignalAgeBars > 0 && age > maxSignalAgeBars)
          return tp1Reached ? "TP1 ATTEINT / PÉRIMÉ" : "PÉRIMÉ";
       bool stopTouched = direction > 0 ? low[bar] <= stop : high[bar] >= stop;
@@ -2289,43 +1761,66 @@ string SignalStatus(const int signalIndex, const int direction, const double ent
    return "ACTIF";
 }
 
-bool SwActionExecute(const int section, const datetime signalTime,
-                     const datetime lastClosedBar, const int direction,
-                     const string rsi7, const string rsi14)
+bool SignalIsActive(const string status)
 {
-   if(section != 0 || signalTime <= 0 || signalTime != lastClosedBar)
-      return false;
-   if(direction == 1) return rsi7 == "HAUSS." && rsi14 == "HAUSS.";
-   if(direction == -1) return rsi7 == "BAISS." && rsi14 == "BAISS.";
+   return status == "ACTIF" || status == "ACTIF (TP n/d)" || status == "TP1 ATTEINT";
+}
+
+// A partial divergence is evidence of its direction, but not of the absence
+// of the other direction.
+string SwInterpretation(const int direction, const string rsi7, const string rsi14)
+{
+   if(direction == 0) return "--";
+   bool bullish = StringFind(rsi7, "HAUSS.") >= 0 || StringFind(rsi14, "HAUSS.") >= 0;
+   bool bearish = StringFind(rsi7, "BAISS.") >= 0 || StringFind(rsi14, "BAISS.") >= 0;
+   bool incomplete = StringFind(rsi7, "n/d") >= 0 || StringFind(rsi14, "n/d") >= 0
+                     || StringFind(rsi7, "partiel") >= 0 || StringFind(rsi14, "partiel") >= 0;
+   string result;
+   if(bullish && bearish) result = "MIXTE";
+   else if(bullish || bearish)
+      result = ((direction > 0 && bullish) || (direction < 0 && bearish))
+               ? "CONCORDANTE" : "OPPOSEE";
+   else return incomplete ? "n/d" : "AUCUNE";
+   return incomplete ? result + " (partiel)" : result;
+}
+
+bool HasOppositeExit(const int signalIndex, const int direction, const int ratesTotal,
+                     const datetime &time[], const double &open[], const double &high[],
+                     const double &low[], const double &close[])
+{
+   for(int bar = signalIndex - 1; bar >= 1; --bar)
+   {
+      int exitDirection, patternIndex, patternLength;
+      string patternName;
+      double stop;
+      if(FindConfirmedSignal(bar, ratesTotal, time, open, high, low, close,
+                             false, false, AllowInsideBarForSearch(true),
+                             exitDirection, patternIndex, patternLength, patternName, stop)
+         && exitDirection != direction)
+         return true;
+   }
    return false;
 }
 
 string TableCellText(const int section, const int row, const int column)
 {
    if(row == 0)
-      return column == 0 ? "SIGNAL" : (section == 0 ? "RECENT" : "PRECEDENT");
+      return column == 0 ? "SIGNAL" : "EN COURS";
    int field = TableFieldForRow(row);
    if(column == 0) return TableLabelCellText(field);
-   if(field == 8) return SwStatisticsText();
-   if(field == 9) return SwSweep;
-   bool latest = section == 0;
-   datetime signalTime = latest ? LatestSignalTime : PreviousSignalTime;
-   if(field == 13)
-      return SwActionExecute(section, signalTime, iTime(_Symbol, _Period, 1),
-                             LatestSignalDirection, SwLatestDiv7, SwLatestDiv14)
-             ? "EXECUTER" : "ATTENDRE";
-   if(signalTime == 0) return "--";
-   if(field == 0) return TimeToString(signalTime, TIME_DATE | TIME_MINUTES);
-   if(field == 1) return ShortPatternName(latest ? LatestSignalName : PreviousSignalName);
-   if(field == 2) return (latest ? LatestSignalDirection : PreviousSignalDirection) > 0 ? "Achat" : "Vente";
-   if(field == 3) return PriceText(latest ? LatestEntry1Price : PreviousEntry1Price);
-   if(field == 4) return PriceText(latest ? LatestStopPrice : PreviousStopPrice);
-   if(field == 5) return RiskText(latest ? LatestEntry1Risk : PreviousEntry1Risk);
-   if(field == 6) return TakeProfitText(latest, 1);
-   if(field == 7) return TakeProfitText(latest, 2);
-   if(field == 10) return latest ? SwLatestRsi : SwPreviousRsi;
-   if(field == 11) return latest ? SwLatestDivergence : SwPreviousDivergence;
-   if(field == 12) return latest ? SwLatestTrend : SwPreviousTrend;
+   if(LatestSignalTime == 0) return "--";
+   if(field == 0) return TimeToString(LatestSignalTime, TIME_DATE | TIME_MINUTES);
+   if(field == 1) return ShortPatternName(LatestSignalName);
+   if(field == 2) return LatestSignalDirection > 0 ? "Achat" : "Vente";
+   if(field == 3) return PriceText(LatestEntry1Price);
+   if(field == 4) return PriceText(LatestStopPrice);
+   if(field == 5) return RiskText(LatestEntry1Risk);
+   if(field == 6) return TakeProfitText(1);
+   if(field == 7) return TakeProfitText(2);
+   if(field == 8) return SwLatestRsi;
+   if(field == 9) return SwLatestDivergence;
+   if(field == 10) return SwLatestTrend;
+   if(field == 11) return SwInterpretation(LatestSignalDirection, SwLatestDiv7, SwLatestDiv14);
    return "";
 }
 
@@ -2390,13 +1885,11 @@ void MeasureTableMetrics()
    for(int field = 0; field < FieldCount; ++field)
       if(TextGetSize(TableLabelCellText(field), width, height) && (int)width > labelWidth)
          labelWidth = (int)width;
-   string samples[7] = {"100.0% (100G/100P, 100 indet., 100 actif)",
-                        "Harami Cross / Étoile filante",
+   string samples[5] = {"Harami Cross / Étoile filante",
                         "SURACHAT (100.0 / 100.0)", "1234567.89 (12.34 R)",
-                        "PDH et PDL (ordre n/d)", "1234567.89 USD",
-                        "7:HAUSS. (partiel) 14:BAISS. (partiel)"};
+                        "1234567.89 USD", "7:HAUSS. (partiel) 14:BAISS. (partiel)"};
    int valueWidth = 0;
-   for(int index = 0; index < 7; ++index)
+   for(int index = 0; index < 5; ++index)
       if(TextGetSize(samples[index], width, height) && (int)width > valueWidth)
          valueWidth = (int)width;
    if(labelWidth > 0) TableLabelColumnWidth = labelWidth + 2 * TableTextPaddingX;
@@ -2456,13 +1949,9 @@ void SetTableCell(const int section, const int row, const int column,
    color cellTextColor = foregroundColor;
    if(column == 1 && row > 0 && TableFieldForRow(row) == 2)
    {
-      datetime signalTime = section == 0 ? LatestSignalTime : PreviousSignalTime;
-      if(signalTime != 0)
-         cellTextColor = (section == 0 ? LatestSignalDirection : PreviousSignalDirection) > 0
-                         ? clrLimeGreen : clrTomato;
+      if(LatestSignalTime != 0)
+         cellTextColor = LatestSignalDirection > 0 ? clrLimeGreen : clrTomato;
    }
-   if(column == 1 && row > 0 && TableFieldForRow(row) == 13)
-      cellTextColor = text == "EXECUTER" ? clrGreen : clrTomato;
    ObjectSetInteger(0, textName, OBJPROP_COLOR, cellTextColor);
    ObjectSetInteger(0, textName, OBJPROP_FONTSIZE, TableFontSizePoints);
    ObjectSetInteger(0, textName, OBJPROP_SELECTABLE, false);
@@ -2702,7 +2191,6 @@ int OnInit()
    }
 
    SwInitHandles();
-   SwLoadStats();
 
    SetIndexBuffer(0, BullishBuffer, INDICATOR_DATA);
    SetIndexBuffer(1, BearishBuffer, INDICATOR_DATA);
@@ -2797,16 +2285,16 @@ int OnCalculate(const int rates_total, const int prev_calculated,
    }
    bool fullRecalculation = prev_calculated == 0 || SignalsDirty;
    bool recalculateSignals = fullRecalculation || newBar || PendingNewBarAlert;
-   if(!recalculateSignals)
+   if(!recalculateSignals && LatestSignalTime > 0)
    {
-      if(SwSweep == "n/d")
-      {
-         SwSweep = SwSweepToday(rates_total, time, high, low, close);
-         if(InpShowTable) UpdateSignalTable();
-      }
-      SwUpdateStats(time[0]);
-      return rates_total;
+      int shift = iBarShift(_Symbol, _Period, LatestSignalTime, true);
+      if(shift < 1 || !SignalIsActive(SignalStatus(shift, LatestSignalDirection,
+                                                   LatestEntry1Price, LatestStopPrice,
+                                                   LatestSignalAdr, high, low)))
+         recalculateSignals = true;
    }
+   if(!recalculateSignals)
+      return rates_total;
 
    // C-R1 : l'alerte d'ENTRÉE est armée UNIQUEMENT à l'ouverture d'une
    // nouvelle barre (newBar, ou premier calcul pour un chargement à chaud).
@@ -2859,31 +2347,13 @@ int OnCalculate(const int rates_total, const int prev_calculated,
    SignalsDirty = false;
    IndicatorDataPending = false;
    LatestSignalTime = 0;
-   PreviousSignalTime = 0;
    LatestEntry1Price = 0.0;
-   PreviousEntry1Price = 0.0;
    LatestEntry1Risk = EMPTY_VALUE;
-   PreviousEntry1Risk = EMPTY_VALUE;
    LatestSignalDirection = 0;
-   PreviousSignalDirection = 0;
-   LatestRsi7 = EMPTY_VALUE;
-   PreviousRsi7 = EMPTY_VALUE;
-   LatestRsi14 = EMPTY_VALUE;
-   PreviousRsi14 = EMPTY_VALUE;
-   LatestRsiStrengthened = false;
-   PreviousRsiStrengthened = false;
    LatestSignalName = "";
-   PreviousSignalName = "";
    LatestStopPrice = EMPTY_VALUE;
-   PreviousStopPrice = EMPTY_VALUE;
    int latestSignalIndex = -1;
-   int previousSignalIndex = -1;
-   LatestPatternIndex = -1;
-   PreviousPatternIndex = -1;
    LatestSignalAdr = EMPTY_VALUE;
-   PreviousSignalAdr = EMPTY_VALUE;
-   LatestStatus = "--";
-   PreviousStatus = "--";
    if(fullRecalculation)
    {
       ArrayInitialize(RejectedByReason, 0);
@@ -2900,6 +2370,8 @@ int OnCalculate(const int rates_total, const int prev_calculated,
    int currentBarEntryDirection = 0;
    string currentBarEntryName = "";
    int currentBarEntryPatternIndex = -1;
+   bool trackedSignalFound = false;
+   bool trackedSignalActive = false;
 
    for(int i = oldestSignalIndex; i >= 1; --i)
    {
@@ -2948,13 +2420,11 @@ int OnCalculate(const int rates_total, const int prev_calculated,
 
       if(direction > 0)
       {
-         BullishBuffer[i] = low[i] - InpArrowOffsetPoints * _Point;
          bullishSwingSignalUsed = true;
          lastBullishSignalTime = time[i];
       }
       else
       {
-         BearishBuffer[i] = high[i] + InpArrowOffsetPoints * _Point;
          bearishSwingSignalUsed = true;
          lastBearishSignalTime = time[i];
       }
@@ -2974,14 +2444,22 @@ int OnCalculate(const int rates_total, const int prev_calculated,
       double entry1Risk = stopPrice == EMPTY_VALUE
                           ? EMPTY_VALUE : EstimateLoss(entry1, stopPrice, direction);
 
-      previousSignalIndex = latestSignalIndex;
-      PreviousSignalTime = LatestSignalTime;
-      PreviousEntry1Price = LatestEntry1Price;
-      PreviousEntry1Risk = LatestEntry1Risk;
-      PreviousSignalDirection = LatestSignalDirection;
-      PreviousSignalName = LatestSignalName;
-      PreviousStopPrice = LatestStopPrice;
-      PreviousPatternIndex = LatestPatternIndex;
+      int maxAge = EffectiveMaxSignalAgeBars();
+      if(maxAge > 0 && i - 1 > maxAge)
+         continue;
+      double candidateAdr = EMPTY_VALUE;
+      ENUM_INDICATOR_READ candidateAdrRead = AdrAtSignal(time[i - 1], candidateAdr);
+      if(candidateAdrRead == INDICATOR_READ_PENDING && i == 1)
+         ReportDataIssue("ADR du signal courant");
+      string candidateStatus = SignalStatus(i, direction, entry1, stopPrice, candidateAdr, high, low);
+      if(time[i] == ActiveSignalTime && direction == ActiveSignalDirection)
+      {
+         trackedSignalFound = true;
+         trackedSignalActive = SignalIsActive(candidateStatus);
+      }
+      if(!SignalIsActive(candidateStatus)
+         || HasOppositeExit(i, direction, rates_total, time, open, high, low, close))
+         continue;
 
       latestSignalIndex = i;
       LatestSignalTime = time[i];
@@ -2990,7 +2468,7 @@ int OnCalculate(const int rates_total, const int prev_calculated,
       LatestSignalDirection = direction;
       LatestSignalName = patternName;
       LatestStopPrice = stopPrice;
-      LatestPatternIndex = patternIndex;
+      LatestSignalAdr = candidateAdr;
    }
 
    if(fullRecalculation)
@@ -3001,36 +2479,15 @@ int OnCalculate(const int rates_total, const int prev_calculated,
                   RejectedByReason[REJECT_STOP], RejectedByReason[REJECT_GEOMETRY],
                   RejectedByReason[REJECT_DATA], RejectedByReason[REJECT_RANGE]);
 
-   if(latestSignalIndex >= 0)
+   if(ActiveSignalDirection != 0 && (!trackedSignalFound || !trackedSignalActive))
    {
-      SwRead(SwRsi7[0], LatestPatternIndex, LatestRsi7);
-      SwRead(SwRsi14[0], LatestPatternIndex, LatestRsi14);
-      LatestRsiStrengthened = IsRsiStrengthened(LatestSignalDirection,
-                                                LatestRsi7, LatestRsi14);
-      ENUM_INDICATOR_READ latestAdr = AdrAtSignal(time[latestSignalIndex - 1], LatestSignalAdr);
-      if(latestAdr == INDICATOR_READ_PENDING && latestSignalIndex == 1)
-         ReportDataIssue("ADR du signal courant");
-      LatestAge = latestSignalIndex - 1;
-      LatestStatus = SignalStatus(latestSignalIndex, LatestSignalDirection,
-                                  LatestEntry1Price, LatestStopPrice, LatestSignalAdr,
-                                  high, low);
+      ActiveSignalDirection = 0;
+      ActiveSignalTime = 0;
    }
 
-   // C7 : l'état actif n'est armé que par un signal récent si l'input est
-   // actif. Rappel : « OnDeinit - Event Handling - MQL5 Reference »
-   // (https://www.mql5.com/en/docs/event_handlers/ondeinit, consultée le
-   // 2026-11-12) : l'événement Deinit précède une ré-initialisation, le
-   // programme est rechargé et PositionStateInitialized repasse à zéro à 
-   // chaque bascule d'unité de temps.
    if(!PositionStateInitialized)
    {
-      if(latestSignalIndex >= 0
-         && (EffectiveMaxSignalAgeBars() <= 0
-             || LatestAge <= EffectiveMaxSignalAgeBars())
-         && LatestStatus != "STOP TOUCHÉ" && LatestStatus != "TP1 ATTEINT / STOP TOUCHÉ"
-         && LatestStatus != "TP2 ATTEINT"
-         && LatestStatus != "PÉRIMÉ" && LatestStatus != "TP1 ATTEINT / PÉRIMÉ"
-         && LatestStatus != "ORDRE INTRABAR INCONNU")
+      if(latestSignalIndex >= 0)
       {
          ActiveSignalDirection = LatestSignalDirection;
          ActiveSignalTime = LatestSignalTime;
@@ -3038,41 +2495,7 @@ int OnCalculate(const int rates_total, const int prev_calculated,
       PositionStateInitialized = true;
    }
 
-   if(previousSignalIndex >= 0)
-   {
-      SwRead(SwRsi7[0], PreviousPatternIndex, PreviousRsi7);
-      SwRead(SwRsi14[0], PreviousPatternIndex, PreviousRsi14);
-      PreviousRsiStrengthened = IsRsiStrengthened(PreviousSignalDirection,
-                                                  PreviousRsi7, PreviousRsi14);
-      AdrAtSignal(time[previousSignalIndex - 1], PreviousSignalAdr);
-      PreviousAge = previousSignalIndex - 1;
-      PreviousStatus = SignalStatus(previousSignalIndex, PreviousSignalDirection,
-                                    PreviousEntry1Price, PreviousStopPrice, PreviousSignalAdr,
-                                    high, low);
-   }
-
-   if(ActiveSignalDirection != 0)
-   {
-      int activeShift = iBarShift(_Symbol, _Period, ActiveSignalTime, true);
-      int maxSignalAgeBars = EffectiveMaxSignalAgeBars();
-      if(activeShift < 1 || (maxSignalAgeBars > 0 && activeShift - 1 > maxSignalAgeBars)
-         || (ActiveSignalTime == LatestSignalTime
-             && (LatestStatus == "STOP TOUCHÉ" || LatestStatus == "TP1 ATTEINT / STOP TOUCHÉ"
-                 || LatestStatus == "TP2 ATTEINT"
-                 || LatestStatus == "PÉRIMÉ" || LatestStatus == "TP1 ATTEINT / PÉRIMÉ"
-                 || LatestStatus == "ORDRE INTRABAR INCONNU")))
-      {
-         ActiveSignalDirection = 0;
-         ActiveSignalTime = 0;
-      }
-   }
-
-   SwSweep = SwSweepToday(rates_total, time, high, low, close);
-   if(!firstCalculation && currentBarEntrySignal
-      && EntryAlertArmedBarTime == time[1] && LastEntryAlertBarTime != time[1])
-      SwRegisterSignal(time[1], currentBarEntryDirection, close[1], LatestStopPrice);
    SwRefreshInfo();
-   SwUpdateStats(time[0]);
    UpdateSignalTable();
 
    // C8 : PendingNewBarAlert est consommé ici, après un recalcul complet.
@@ -3141,8 +2564,8 @@ int OnCalculate(const int rates_total, const int prev_calculated,
       // A7 : libellé dirigé pour l'inside bar dans le message d'alerte.
       string patternLabel = SignalDisplayName(patternName, direction);
       string side = direction > 0 ? "achat" : "vente";
-      ActiveSignalDirection = direction;
-      ActiveSignalTime = time[confirmationIndex];
+      ActiveSignalDirection = LatestSignalDirection;
+      ActiveSignalTime = LatestSignalTime;
       double rsi7 = EMPTY_VALUE, rsi14 = EMPTY_VALUE;
       SwRead(SwRsi7[0], currentBarEntryPatternIndex, rsi7);
       SwRead(SwRsi14[0], currentBarEntryPatternIndex, rsi14);
@@ -3157,6 +2580,14 @@ int OnCalculate(const int rates_total, const int prev_calculated,
                                     EnumToString((ENUM_TIMEFRAMES)_Period),
                                     rsi7Text, rsi14Text, rsiStatus);
       RaiseAlert(message);
+   }
+
+   if(latestSignalIndex >= 1)
+   {
+      if(LatestSignalDirection > 0)
+         BullishBuffer[latestSignalIndex] = low[latestSignalIndex] - InpArrowOffsetPoints * _Point;
+      else
+         BearishBuffer[latestSignalIndex] = high[latestSignalIndex] + InpArrowOffsetPoints * _Point;
    }
 
    // C-R1 : consommation de l'armement quand la passe s'achève sans alerte
@@ -3321,7 +2752,7 @@ void OnDeinit(const int reason)
    // P6 : nettoyage par DeleteTableObjects, qui balaye les bornes maximales
    // et supprime aussi cadre, poignée et titre. Une boucle utilisant
    // TableColumnCount(section) vaudrait 0 pour une section masquée : avec
-   // InpShowPreviousSection = false, les cellules de la section PRÉCÉDENT
+   // le panneau réduit à une section, les cellules de la section PRÉCÉDENT
    // auraient survécu au retrait de l'indicateur.
    DeleteTableObjects();
 
@@ -3728,7 +3159,6 @@ color ToolColor(const int index)
 void OnTimer()
 {
    DrawTradingSessions();
-   SwUpdateStats(iTime(_Symbol, _Period, 0));
    SwRefreshInfo();
    if(InpShowTable) UpdateSignalTable();
 }

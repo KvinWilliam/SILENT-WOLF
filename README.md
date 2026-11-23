@@ -9,6 +9,14 @@ Indicateurs MetaTrader 5 de détection de figures de retournement, avec panneaux
 
 Les deux fichiers sont des indicateurs personnalisés MT5, pas des Expert Advisors : ils affichent des signaux et peuvent envoyer des alertes, mais ne passent pas d'ordres.
 
+## Signal et interprétation
+
+Chaque indicateur affiche au maximum une flèche et un panneau pour le dernier signal encore actif sur le symbole et l'unité de temps du graphique. Un signal n'est plus actif après expiration, stop, TP2, ordre intrabar indéterminé ou confirmation d'une sortie opposée. TP1 seul ne termine pas le signal. Le suivi du stop et des objectifs inclut la bougie en cours ; si l'ADR nécessaire aux objectifs est indisponible, ceux-ci ne peuvent pas être vérifiés. Les signaux historiques sont recalculés à partir des zones présentes actuellement.
+
+La rubrique **INTERPRETATION** compare le sens du signal aux divergences RSI 7 et 14 à la confirmation : concordante si elles vont dans le sens du signal, opposée si elles vont dans le sens contraire, mixte si les deux sens sont présents, aucune s'il n'y a pas de divergence, et `n/d` si les données nécessaires manquent. Un résultat marqué `partiel` repose sur des données incomplètes ; il ne signifie pas que l'autre sens est absent.
+
+Les anciennes rubriques Actions, Sweep du jour et Taux de réussite ainsi que le suivi statistique associé ont été retirés. Les fichiers statistiques déjà présents dans le dossier de données MT5 ne sont pas supprimés.
+
 ## Installation
 
 1. Dans MetaTrader 5, choisissez **Fichier > Ouvrir le dossier des données**.
@@ -17,3 +25,7 @@ Les deux fichiers sont des indicateurs personnalisés MT5, pas des Expert Adviso
 4. Dans le Navigateur de MT5, actualisez **Indicateurs** puis ajoutez l'indicateur au graphique.
 
 Configurez les alertes et, pour le Forex, le décalage GMT du serveur du broker dans les paramètres de l'indicateur. Testez les signaux sur un compte démo avant toute utilisation en conditions réelles.
+
+## Vérification
+
+Avec Node.js, `node tests\indicator-logic.test.js` vérifie les cas de statut, sortie et interprétation communs aux deux indicateurs. Ce test ne remplace ni la compilation dans MetaEditor ni la vérification sur un graphique MT5.
