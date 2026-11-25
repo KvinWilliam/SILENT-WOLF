@@ -1,8 +1,8 @@
 #property strict
 #property indicator_chart_window
 #property version   "1.00"
-#property indicator_buffers 2
-#property indicator_plots   2
+#property indicator_buffers 7
+#property indicator_plots   7
 
 #property indicator_label1  "Bullish pin bar fusion"
 #property indicator_type1   DRAW_ARROW
@@ -13,6 +13,17 @@
 #property indicator_type2   DRAW_ARROW
 #property indicator_color2  clrTomato
 #property indicator_width2  2
+
+#property indicator_label3  "SW Entry"
+#property indicator_type3   DRAW_NONE
+#property indicator_label4  "SW Stop"
+#property indicator_type4   DRAW_NONE
+#property indicator_label5  "SW TP1"
+#property indicator_type5   DRAW_NONE
+#property indicator_label6  "SW TP2"
+#property indicator_type6   DRAW_NONE
+#property indicator_label7  "SW Force"
+#property indicator_type7   DRAW_NONE
 
 enum ENUM_STOP_BUFFER_MODE
 {
@@ -62,6 +73,7 @@ enum ENUM_INDICATOR_READ
    INDICATOR_READ_UNAVAILABLE = 2
 };
 
+input bool   InpInternalBufferOnly  = false;     // Instance interne SWRobots, sans interface ni alertes
 input double InpWickBodyRatio       = 2.0;       // Dominant wick / body: strictly greater than this ratio
 input int    InpArrowOffsetPoints    = 20;        // Arrow distance from candle, in points
 input int    InpSwingLookbackBars    = 5;         // Bars used to identify pin swings and Dow pivots
@@ -79,7 +91,6 @@ input ENUM_STOP_BUFFER_MODE InpStopBufferMode = STOP_BUFFER_FIXED_POINTS;
 input double InpStopBufferPoints    = 1.0;       // Fixed stop buffer in points
 input int    InpAtrPeriod            = 14;        // ATR period for stop buffer
 input double InpAtrMultiplier        = 0.10;      // ATR fraction beyond pin-bar extreme
-input int    InpAdrPeriod            = 14;        // ADR period: completed daily bars
 input double InpRsiOversold          = 20.0;
 input double InpRsiOverbought        = 80.0;
 input double InpMinWickRangeRatio    = 0.0;       // 0 = off ; hypothèse à tester : 0.60
@@ -90,8 +101,6 @@ input string InpSoundFile            = "alert.wav";
 input bool   InpEnablePush           = true;     // Requires MT5 notifications configured
 input bool   InpEnableAlertPopup     = true;     // C9 : fenêtre Alert() du terminal
 input bool   InpEnableEmail          = false;    // C9 : SendMail (onglet Email du terminal)
-input bool   InpFallbackToSinglePin  = true;     // Repli pin simple si la fusion échoue
-input bool   InpEnableUnclassifiedFusion = false; // Entrée : fusion sans pattern reconnu
 input double InpHaramiCrossMaxBodyRatio = 0.10; // Corps du doji / amplitude maximale
 input bool   InpPiercingBeforeHarami = false;    // C2 : Pénétrante/Nuage noir testés avant Harami
 input bool   InpRejectIfStopTouched  = true;     // C3 : invalider si la confirmation touche le stop
@@ -118,10 +127,7 @@ input bool   InpShowTable            = true;     // P6 : afficher le panneau de 
 // Définition retenue (convention courante, PAS une norme) : range de la
 // bougie inside entièrement contenu dans celui de la mère. La couleur des
 // bougies est sans importance. Ce n'est PAS un Harami (corps + couleurs).
-input bool   InpEnableInsideBar         = true;  // A1 : détecter l'inside bar
 input double InpInsideBarMaxRatio       = 1.0;   // A1 : range inside / range mère maximum
-input bool   InpInsideBarRequireFusedPin = true;  // Sortie : exiger la forme fusionnée (toujours exigée en entrée)
-input bool   InpInsideBarUseForExit     = false; // A6 : inside bar admise en alerte de SORTIE
 input bool   InpAutoCompactTable        = true;  // Adapter le nombre de lignes à la hauteur du graphique
 // C-R1 : false (défaut) = alerte d'ENTRÉE uniquement à l'ouverture de barre
 // (avec rattrapage si des données d'indicateur manquaient alors). true =
@@ -154,6 +160,11 @@ const string SessionObjectPrefix = "TS_";
 
 double BullishBuffer[];
 double BearishBuffer[];
+double SignalEntryBuffer[];
+double SignalStopBuffer[];
+double SignalTp1Buffer[];
+double SignalTp2Buffer[];
+double SignalForceBuffer[];
 int AtrHandle = INVALID_HANDLE;
 datetime LastBarTime = 0;
 bool SignalsDirty = true;
@@ -172,10 +183,9 @@ bool IndicatorDataPending = false;         // C10
 int DataRetryCount = 0;                    // C10
 datetime LastDataWarningTime = 0;          // C10
 datetime LastSoundWarningTime = 0;         // C9
-datetime LastAdrWarningTime = 0;
 const int MaxDataRetries = 10;             // C10
 datetime LastEntryAlertBarTime = 0;        // P3 : dernière barre alertée en ENTRÉE
-datetime LastExitAlertBarTime = 0;         // P3 : dernière barre traitée en SORTIE
+datetime LastExitProcessedBarTime = 0;     // Dernière barre de sortie traitée
 // C-R1 : barre de confirmation pour laquelle l'alerte d'ENTRÉE est armée.
 // Armée uniquement à l'ouverture d'une barre ; consommée dès qu'une passe
 // complète s'achève avec des données exploitables (alerte émise, ou
@@ -189,8 +199,10 @@ bool ChartEventCreateForced = false;       // P5
 bool ChartEventDeleteForced = false;       // P5
 
 // C12: field indexes determine panel rows and colorization.
-const int FieldCount     = 17;
-double LatestSignalAdr = EMPTY_VALUE;
+const int FieldCount     = 13;
+double LatestTakeProfit1 = EMPTY_VALUE;
+double LatestTakeProfit2 = EMPTY_VALUE;
+double SwLatestSignalStrengthValue = EMPTY_VALUE;
 ENUM_REJECTION_REASON CandidateRejection = REJECT_NONE;
 bool CandidatePatternFound = false;
 int RejectedByReason[8];
@@ -268,6 +280,7 @@ string SwLatestRsi;
 string SwLatestDivergence = "n/d";
 string SwLatestDiv7 = "n/d";
 string SwLatestDiv14 = "n/d";
+string SwLatestSignalStrength = "n/d";
 string SwCurrentTrend = "n/d";
 
 string SwTimeframeName()
@@ -348,18 +361,21 @@ int SwLastClosedShift(const ENUM_TIMEFRAMES tf, const datetime at)
    return shift;
 }
 
-string SwRsiAt(const datetime at)
+string SwRsiAt(const datetime at, double &rsi7, double &rsi14)
 {
+   rsi7 = EMPTY_VALUE;
+   rsi14 = EMPTY_VALUE;
    int shift = SwLastClosedShift((ENUM_TIMEFRAMES)_Period, at);
    if(shift < 0 || Bars(_Symbol, _Period) <= shift + 14)
       return "n/d";
-   double fast, slow;
-   if(!SwRead(SwRsi7[0], shift, fast) || !SwRead(SwRsi14[0], shift, slow))
+   bool fastReady = SwRead(SwRsi7[0], shift, rsi7);
+   bool slowReady = SwRead(SwRsi14[0], shift, rsi14);
+   if(!fastReady || !slowReady)
       return "n/d";
    string state = "RANGE";
-   if(fast <= InpRsiOversold && slow <= InpRsiOversold) state = "SURVENTE";
-   else if(fast >= InpRsiOverbought && slow >= InpRsiOverbought) state = "SURACHAT";
-   return StringFormat("%s (%.1f / %.1f)", state, fast, slow);
+   if(rsi7 <= InpRsiOversold && rsi14 <= InpRsiOversold) state = "SURVENTE";
+   else if(rsi7 >= InpRsiOverbought && rsi14 >= InpRsiOverbought) state = "SURACHAT";
+   return StringFormat("%s (%.1f / %.1f)", state, rsi7, rsi14);
 }
 
 bool SwDivergencePivot(const MqlRates &bars[], const int index, const bool high)
@@ -443,6 +459,43 @@ string SwDivergenceAt(const datetime at, string &rsi7, string &rsi14)
    return "7:" + rsi7 + " 14:" + rsi14;
 }
 
+int SwSignalStrengthScore(const int direction, const double rsi7, const double rsi14,
+                          const string divergence7, const string divergence14)
+{
+   if(direction == 0)
+      return 0;
+
+   int score = 40;
+   bool rsi7Ready = rsi7 != EMPTY_VALUE && MathIsValidNumber(rsi7);
+   bool rsi14Ready = rsi14 != EMPTY_VALUE && MathIsValidNumber(rsi14);
+   bool rsi7Extreme = rsi7Ready && (direction > 0
+                     ? rsi7 <= InpRsiOversold : rsi7 >= InpRsiOverbought);
+   bool rsi14Extreme = rsi14Ready && (direction > 0
+                      ? rsi14 <= InpRsiOversold : rsi14 >= InpRsiOverbought);
+   if(rsi7Extreme) score += 15;
+   if(rsi14Extreme) score += 15;
+
+   bool divergence7Ready = StringFind(divergence7, "n/d") < 0
+                           && StringFind(divergence7, "partiel") < 0;
+   bool divergence14Ready = StringFind(divergence14, "n/d") < 0
+                            && StringFind(divergence14, "partiel") < 0;
+   if(divergence7Ready && divergence14Ready)
+   {
+      bool aligned7 = direction > 0
+                      ? StringFind(divergence7, "HAUSS.") >= 0
+                        && StringFind(divergence7, "BAISS.") < 0
+                      : StringFind(divergence7, "BAISS.") >= 0
+                        && StringFind(divergence7, "HAUSS.") < 0;
+      bool aligned14 = direction > 0
+                       ? StringFind(divergence14, "HAUSS.") >= 0
+                         && StringFind(divergence14, "BAISS.") < 0
+                       : StringFind(divergence14, "BAISS.") >= 0
+                         && StringFind(divergence14, "HAUSS.") < 0;
+      score += aligned7 && aligned14 ? 30 : 15;
+   }
+   return score;
+}
+
 string SwTrendAt(const int shift)
 {
    if(shift < 0 || Bars(_Symbol, _Period) <= shift + 200) return "n/d";
@@ -454,101 +507,10 @@ string SwTrendAt(const int shift)
    return "INDECISE";
 }
 
-bool SwSupportsVwap()
+bool SwSupportsSignals()
 {
    return _Period == PERIOD_M5 || _Period == PERIOD_M15 || _Period == PERIOD_M30
           || _Period == PERIOD_H1 || _Period == PERIOD_H4;
-}
-
-datetime SwVwapAnchor(const datetime barTime)
-{
-   MqlDateTime parts;
-   if(!TimeToStruct(barTime, parts))
-      return 0;
-   int daysBack = 0;
-   if(_Period == PERIOD_H1 || _Period == PERIOD_H4)
-      daysBack = parts.day_of_week == 0 ? 6 : parts.day_of_week - 1;
-   parts.hour = 0;
-   parts.min = 0;
-   parts.sec = 0;
-   return StructToTime(parts) - daysBack * 86400;
-}
-
-double SwVwap = EMPTY_VALUE;
-string SwVwapDirection = "n/d";
-double SwVwapDistanceAtr = EMPTY_VALUE;
-double SwVwapPrice = EMPTY_VALUE;
-
-string SwVwapContext()
-{
-   if(LatestSignalDirection == 0 || SwVwap == EMPTY_VALUE
-      || SwVwapPrice == EMPTY_VALUE || SwVwapDirection == "n/d")
-      return "n/d";
-   if(LatestSignalDirection > 0 && SwVwapPrice > SwVwap && SwVwapDirection == "HAUSSIER")
-      return "ALIGNE";
-   if(LatestSignalDirection < 0 && SwVwapPrice < SwVwap && SwVwapDirection == "BAISSIER")
-      return "ALIGNE";
-   return "NON ALIGNE";
-}
-
-bool SwCalculateVwap(const MqlRates &rates[], double &current, double &previous)
-{
-   int count = ArraySize(rates);
-   if(count < 1)
-      return false;
-   double weighted = 0.0, total = 0.0;
-   previous = EMPTY_VALUE;
-   for(int i = 0; i < count; ++i)
-   {
-      if(rates[i].tick_volume < 0 || !MathIsValidNumber(rates[i].high)
-         || !MathIsValidNumber(rates[i].low) || !MathIsValidNumber(rates[i].close)
-         || rates[i].high == EMPTY_VALUE || rates[i].low == EMPTY_VALUE
-         || rates[i].close == EMPTY_VALUE)
-         return false;
-      if(i == count - 1 && total > 0.0)
-         previous = weighted / total;
-      double price = (rates[i].high + rates[i].low + rates[i].close) / 3.0;
-      weighted += price * (double)rates[i].tick_volume;
-      total += (double)rates[i].tick_volume;
-   }
-   if(total <= 0.0 || !MathIsValidNumber(weighted) || !MathIsValidNumber(total))
-      return false;
-   current = weighted / total;
-   return MathIsValidNumber(current);
-}
-
-void SwUpdateVwap()
-{
-   if(!InpShowTable || !SwSupportsVwap())
-      return;
-   SwVwap = EMPTY_VALUE;
-   SwVwapDirection = "n/d";
-   SwVwapDistanceAtr = EMPTY_VALUE;
-   SwVwapPrice = EMPTY_VALUE;
-   datetime barTime = iTime(_Symbol, _Period, 0);
-   datetime anchor = SwVwapAnchor(barTime);
-   if(barTime <= 0 || anchor <= 0)
-      return;
-   MqlRates rates[];
-   int count = CopyRates(_Symbol, _Period, anchor, barTime, rates);
-   long synchronized = 0, firstDate = 0;
-   if(count < 1 || rates[count - 1].time != barTime
-      || !SeriesInfoInteger(_Symbol, _Period, SERIES_SYNCHRONIZED, synchronized)
-      || synchronized == 0
-      || !SeriesInfoInteger(_Symbol, _Period, SERIES_FIRSTDATE, firstDate)
-      || firstDate <= 0 || firstDate > anchor)
-      return;
-   double current, previous;
-   if(!SwCalculateVwap(rates, current, previous))
-      return;
-   SwVwap = current;
-   SwVwapPrice = rates[count - 1].close;
-   if(previous != EMPTY_VALUE && rates[count - 1].tick_volume > 0)
-      SwVwapDirection = current > previous ? "HAUSSIER" : current < previous ? "BAISSIER" : "PLAT";
-   double atr[];
-   if(AtrHandle != INVALID_HANDLE && CopyBuffer(AtrHandle, 0, 1, 1, atr) == 1
-      && MathIsValidNumber(atr[0]) && atr[0] != EMPTY_VALUE && atr[0] > 0.0)
-      SwVwapDistanceAtr = (rates[count - 1].close - current) / atr[0];
 }
 
 void SwRefreshInfo()
@@ -557,6 +519,8 @@ void SwRefreshInfo()
    SwLatestDivergence = "n/d";
    SwLatestDiv7 = "n/d";
    SwLatestDiv14 = "n/d";
+   SwLatestSignalStrength = "n/d";
+   SwLatestSignalStrengthValue = EMPTY_VALUE;
    SwCurrentTrend = SwTrendAt(1);
    int shift = iBarShift(_Symbol, _Period, LatestSignalTime, true);
    if(LatestSignalTime <= 0 || shift < 1)
@@ -564,8 +528,13 @@ void SwRefreshInfo()
    datetime at = iTime(_Symbol, _Period, shift - 1);
    if(at <= 0)
       return;
-   SwLatestRsi = SwRsiAt(at);
+   double rsi7, rsi14;
+   SwLatestRsi = SwRsiAt(at, rsi7, rsi14);
    SwLatestDivergence = SwDivergenceAt(at, SwLatestDiv7, SwLatestDiv14);
+   int score = SwSignalStrengthScore(LatestSignalDirection, rsi7, rsi14,
+                                     SwLatestDiv7, SwLatestDiv14);
+   SwLatestSignalStrengthValue = (double)score;
+   SwLatestSignalStrength = IntegerToString(score) + "%";
 }
 
 bool RefreshChartZones()
@@ -609,6 +578,32 @@ bool RefreshChartZones()
       return false;
    }
    return true;
+}
+
+int OldestZoneSignalIndex(const int limit, const datetime &time[])
+{
+   int count = ArraySize(ChartZones);
+   if(count == 0)
+      return 0;
+   datetime firstStart = ChartZones[0].start;
+   for(int index = 1; index < count; ++index)
+      if(ChartZones[index].start < firstStart)
+         firstStart = ChartZones[index].start;
+
+   int first = 1, last = limit, result = 0;
+   while(first <= last)
+   {
+      int middle = first + (last - first) / 2;
+      datetime patternEnd = time[middle + 1] + PeriodSeconds(_Period);
+      if(patternEnd >= firstStart)
+      {
+         result = middle;
+         first = middle + 1;
+      }
+      else
+         last = middle - 1;
+   }
+   return result;
 }
 
 // C13 : extrêmes fusionnés d'une plage de barres (indexation série, donc
@@ -765,15 +760,6 @@ bool IsInsideBar(const int i, const double &high[], const double &low[])
    return (high[i] - low[i]) < InpInsideBarMaxRatio * motherRange;
 }
 
-// A6 : participation de l'inside bar. ENTRÉE : InpEnableInsideBar.
-// SORTIE : InpEnableInsideBar && InpInsideBarUseForExit.
-bool AllowInsideBarForSearch(const bool isExitSearch)
-{
-   if(!InpEnableInsideBar)
-      return false;
-   return !isExitSearch || InpInsideBarUseForExit;
-}
-
 // A2 : reconnaît un nom de pattern inside bar.
 bool IsInsideBarName(const string patternName)
 {
@@ -800,6 +786,12 @@ bool FindPattern(const int i, const int rates_total,
 
    if(i + 1 < rates_total)
    {
+      if(allowInsideBar && IsInsideBar(i, high, low))
+      {
+         patternLength = 2;
+         patternName = "Inside bar";
+         return true;
+      }
       if(IsHaramiCross(i, open, high, low, close, direction))
       {
          patternLength = 2;
@@ -853,20 +845,6 @@ bool FindPattern(const int i, const int rates_total,
             direction = -1; patternLength = 2; patternName = "Nuage noir";
             return true;
          }
-      }
-      // A2 : l'inside bar est testée EN DERNIER, après tous les patterns
-      // existants, quel que soit l'ordre choisi par C2. Une paire à la fois
-      // Harami et inside bar garde donc l'étiquette Harami. F1 : direction = 0
-      // est ici un CONTRAT VOLONTAIRE, pas une omission — l'appelant
-      // (FindConfirmedSignal) affecte direction = patternSwingDirection pour
-      // l'inside bar dès que le swing est résolu, avant tout usage de
-      // direction. Les extrêmes du pattern sont ceux de la mère (l'inside
-      // est contenue dans son range).
-      if(allowInsideBar && IsInsideBar(i, high, low))
-      {
-         patternLength = 2;
-         patternName = "Inside bar";
-         return true;
       }
    }
 
@@ -1284,75 +1262,117 @@ bool PassesMinRangeFilter(const int patternIndex, const int patternLength,
    return true;
 }
 
-ENUM_INDICATOR_READ ReadAdrBars(const int firstShift, double &adr)
+double ContextTargetPrice(const double entry, const double stop, const int direction,
+                          const double &levels[], const int number)
 {
-   adr = EMPTY_VALUE;
-   MqlRates rates[];
-   int count = CopyRates(_Symbol, PERIOD_D1, firstShift, InpAdrPeriod, rates);
-   if(count != InpAdrPeriod)
-      return INDICATOR_READ_PENDING;
-   double total = 0.0;
-   for(int i = 0; i < count; ++i)
-   {
-      double range = rates[i].high - rates[i].low;
-      if(!MathIsValidNumber(range) || range <= 0.0)
-      {
-         datetime now = TimeCurrent();
-         if(LastAdrWarningTime == 0 || now - LastAdrWarningTime >= 60)
-         {
-            LastAdrWarningTime = now;
-            Print("ADR indisponible : une bougie D1 a une plage nulle ou invalide.");
-         }
-         return INDICATOR_READ_UNAVAILABLE;
-      }
-      total += range;
-   }
-   adr = total / InpAdrPeriod;
-   if(!MathIsValidNumber(adr) || adr <= 0.0)
-   {
-      adr = EMPTY_VALUE;
-      return INDICATOR_READ_UNAVAILABLE;
-   }
-   return INDICATOR_READ_OK;
-}
-
-// Exclure la D1 contenant la clôture du signal.
-ENUM_INDICATOR_READ AdrAtSignal(const datetime confirmationCloseTime, double &adr)
-{
-   adr = EMPTY_VALUE;
-   int dayShift = iBarShift(_Symbol, PERIOD_D1, confirmationCloseTime, false);
-   if(dayShift < 0)
-      return INDICATOR_READ_PENDING;
-   return ReadAdrBars(dayShift + 1, adr);
-}
-
-bool TargetPrice(const double entry, const double stop, const int direction,
-                 const double adr, const int number, double &target)
-{
-   target = EMPTY_VALUE;
    if(!MathIsValidNumber(entry) || !MathIsValidNumber(stop)
-      || stop == EMPTY_VALUE || direction == 0
-      || direction * (entry - stop) <= 0.0)
-      return false;
-   double distance = adr;
-   if(distance == EMPTY_VALUE || !MathIsValidNumber(distance) || distance <= 0.0)
-      return false;
-   // Le mode ADR conserve TP1 = ADR et TP2 = 3 ADR de la v2.03.
-   double multiple = number == 1 ? 1.0 : 3.0;
-   double raw = entry + direction * distance * multiple;
-   double tick = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-   if(!MathIsValidNumber(raw) || !MathIsValidNumber(tick) || tick <= 0.0)
-      return false;
-   target = NormalizeDouble(MathRound(raw / tick) * tick, _Digits);
-   return MathIsValidNumber(target) && direction * (target - entry) > 0.0;
+      || entry == EMPTY_VALUE || stop == EMPTY_VALUE
+      || (direction != 1 && direction != -1) || direction * (entry - stop) <= 0.0
+      || number < 1 || number > 2)
+      return EMPTY_VALUE;
+
+   double minimumDistance = 2.0 * MathAbs(entry - stop);
+   double firstTarget = EMPTY_VALUE;
+   double selectedTarget = EMPTY_VALUE;
+   for(int targetNumber = 1; targetNumber <= number; ++targetNumber)
+   {
+      double nearestDistance = 1.0e100;
+      selectedTarget = EMPTY_VALUE;
+      for(int i = 0; i < ArraySize(levels); ++i)
+      {
+         double level = levels[i];
+         if(level == EMPTY_VALUE || !MathIsValidNumber(level))
+            continue;
+         double distance = direction * (level - entry);
+         if(distance + _Point * 1.0e-6 < minimumDistance)
+            continue;
+         if(targetNumber == 2 && MathAbs(level - firstTarget) <= _Point * 0.5)
+            continue;
+         if(distance < nearestDistance)
+         {
+            nearestDistance = distance;
+            selectedTarget = level;
+         }
+      }
+      if(selectedTarget == EMPTY_VALUE)
+      {
+         if(targetNumber != 1 || number != 1)
+            return EMPTY_VALUE;
+         double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+         if(!MathIsValidNumber(tickSize) || tickSize <= 0.0)
+         {
+            ReportDataIssue("taille du tick pour TP");
+            return EMPTY_VALUE;
+         }
+         double rawTarget = entry + direction * minimumDistance;
+         double ticks = direction > 0 ? MathCeil(rawTarget / tickSize)
+                                      : MathFloor(rawTarget / tickSize);
+         return NormalizeDouble(ticks * tickSize, _Digits);
+      }
+      if(targetNumber == 1)
+         firstTarget = selectedTarget;
+   }
+   return selectedTarget;
+}
+
+void ContextTargetsAtSignal(const double entry, const double stop, const int direction,
+                            const datetime confirmationCloseTime,
+                            double &tp1, double &tp2)
+{
+   tp1 = EMPTY_VALUE;
+   tp2 = EMPTY_VALUE;
+   if(!MathIsValidNumber(entry) || direction == 0)
+      return;
+
+   double levels[6];
+   ArrayInitialize(levels, EMPTY_VALUE);
+   int levelCount = 0;
+   bool levelsComplete = true;
+   ENUM_TIMEFRAMES periods[3] = {PERIOD_D1, PERIOD_W1, PERIOD_MN1};
+   string periodNames[3] = {"D1", "W1", "MN"};
+   for(int i = 0; i < ArraySize(periods); ++i)
+   {
+      ResetLastError();
+      int shift = iBarShift(_Symbol, periods[i], confirmationCloseTime, false);
+      if(shift < 0)
+      {
+         ReportDataIssue("Open/clôture précédente " + periodNames[i]);
+         levelsComplete = false;
+         continue;
+      }
+
+      MqlRates currentPeriod[1];
+      MqlRates previousPeriod[1];
+      ResetLastError();
+      if(CopyRates(_Symbol, periods[i], shift, 1, currentPeriod) == 1)
+         levels[levelCount++] = currentPeriod[0].open;
+      else
+      {
+         ReportDataIssue("Open " + periodNames[i]);
+         levelsComplete = false;
+      }
+
+      ResetLastError();
+      if(CopyRates(_Symbol, periods[i], shift + 1, 1, previousPeriod) == 1)
+         levels[levelCount++] = previousPeriod[0].close;
+      else
+      {
+         ReportDataIssue("clôture précédente " + periodNames[i]);
+         levelsComplete = false;
+      }
+   }
+
+   if(!levelsComplete)
+      return;
+   tp1 = ContextTargetPrice(entry, stop, direction, levels, 1);
+   tp2 = ContextTargetPrice(entry, stop, direction, levels, 2);
 }
 
 
 
 // P1 : applyStopCheck pilote le seul contrôle C3. Entrées : true. Sortie :
 // false, comme dans l'original. Le stop reste calculé dans les deux cas.
-// A4 : pour une inside bar, la pin fusionnée est exigée par défaut, en plus
-// de la cassure. Le libellé est alors suffixé par la forme.
+// La forme fusionnée doit être une pin bar, y compris pour une inside bar.
 bool IsConfirmedSignalCandidate(const int confirmationIndex,
                              const int ratesTotal,
                              const datetime &time[], const double &open[],
@@ -1366,26 +1386,11 @@ bool IsConfirmedSignalCandidate(const int confirmationIndex,
    stopPrice = EMPTY_VALUE;
    pinShape = "";
 
-   bool isInsideBar = IsInsideBarName(patternName);
-
-   if(isInsideBar)
+   if(!IsConfirmedPinBar(patternIndex, patternLength, direction,
+                         pinShape, open, high, low, close))
    {
-      if((applyStopCheck || InpInsideBarRequireFusedPin)
-         && !IsConfirmedPinBar(patternIndex, patternLength, direction,
-                               pinShape, open, high, low, close))
-      {
-         CandidateRejection = REJECT_GEOMETRY;
-         return false;
-      }
-   }
-   else
-   {
-      if(!IsConfirmedPinBar(patternIndex, patternLength, direction,
-                            pinShape, open, high, low, close))
-      {
-         CandidateRejection = REJECT_GEOMETRY;
-         return false;
-      }
+      CandidateRejection = REJECT_GEOMETRY;
+      return false;
    }
 
    // C6 : filtre de taille (désactivé par défaut).
@@ -1446,16 +1451,14 @@ bool IsConfirmedSignalCandidate(const int confirmationIndex,
 }
 
 // P1 : true -> ENTRÉE (C3 appliqué) ; false -> SORTIE (C3 non appliqué).
-// A6 : allowInsideBar calculé par l'appelant — ENTRÉE : InpEnableInsideBar ;
-// SORTIE : InpEnableInsideBar && InpInsideBarUseForExit.
+// Les inside bars sont recherchées uniquement en entrée.
 // F1 (CORRECTIF MAJEUR) : pour un pattern inside bar, la direction retournée
 // par FindPattern vaut 0 (contrat documenté). Elle est affectée ICI, à partir
 // du swing résolu, AVANT la comparaison et AVANT tout usage de direction
 // (zone, cassure, follow-through, stop). Sans cela, la comparaison
 // patternSwingDirection != direction était vraie systématiquement (le swing
 // vaut toujours +1 ou -1 quand il est résolu) et l'inside bar ne produisait
-// JAMAIS de signal. Le chemin de SORTIE (AllowInsideBarForSearch(true))
-// transite par la même ligne, donc il est couvert par le même correctif.
+// JAMAIS de signal.
 bool FindConfirmedSignal(const int confirmationIndex, const int rates_total,
                          const datetime &time[], const double &open[],
                          const double &high[], const double &low[],
@@ -1474,6 +1477,15 @@ bool FindConfirmedSignal(const int confirmationIndex, const int rates_total,
    if(patternIndex >= rates_total)
       return false;
 
+   // Exclure aussi les chevauchements avec d'autres patterns en sortie,
+   // indépendamment du filtre de taille des inside bars en entrée.
+   if(!allowInsideBar && patternIndex + 1 < rates_total
+      && high[patternIndex] < high[patternIndex + 1]
+      && low[patternIndex] > low[patternIndex + 1])
+      return false;
+
+   bool insideBar = allowInsideBar && patternIndex + 1 < rates_total
+                    && IsInsideBar(patternIndex, high, low);
    bool mergedPattern = FindPattern(patternIndex, rates_total, open, high, low,
                                     close, allowInsideBar,
                                     direction, patternLength, patternName);
@@ -1516,26 +1528,20 @@ bool FindConfirmedSignal(const int confirmationIndex, const int rates_total,
 
       if(mergedAccepted)
       {
-         // A2/A4 : suffixe « - forme » uniquement si une forme existe. Pour
-         // une inside bar sans forme exigée, seul le nom du pattern est
-         // retenu ; le libellé dirigé (haussier/baissier) est construit au
-         // moment de l'affichage par SignalDisplayName.
          if(fusedShape != "")
             patternName += " - " + fusedShape;
          signalPatternIndex = patternIndex;
          return true;
       }
 
-      // C1 : sans repli, l'échec du chemin fusionné masque le chemin pin
-      // simple sur la même barre (comportement d'origine, défaut conservé).
-      if(!InpFallbackToSinglePin)
-         return false;
-
       direction = 0;
       patternLength = 0;
       patternName = "";
       stopPrice = EMPTY_VALUE;
    }
+
+   if(insideBar)
+      return false;
 
    if(FindSinglePinBar(patternIndex, rates_total, open, high, low, close,
                        direction, patternName))
@@ -1553,11 +1559,9 @@ bool FindConfirmedSignal(const int confirmationIndex, const int rates_total,
       }
    }
 
-   if(!InpEnableUnclassifiedFusion || !applyStopCheck || mergedPattern
-      || patternIndex + 1 >= rates_total)
+   if(!applyStopCheck || mergedPattern || patternIndex + 1 >= rates_total)
       return false;
 
-   // Une inside bar désactivée ne doit pas contourner son réglage.
    int recognizedDirection, recognizedLength;
    string recognizedName;
    if(FindPattern(patternIndex, rates_total, open, high, low, close, true,
@@ -1632,7 +1636,7 @@ int TableColumnCount(const int section)
 // Nombre de lignes affichées par section, en-tête inclus.
 int TableSectionRowCount()
 {
-   int visibleFields = SwSupportsVwap() ? FieldCount : FieldCount - 4;
+   int visibleFields = FieldCount;
    if(InpAutoCompactTable)
    {
       long height = ChartGetInteger(0, CHART_HEIGHT_IN_PIXELS);
@@ -1652,14 +1656,6 @@ int TableFieldForRow(const int row)
    if(row == 4) return 12;
    if(row == 5) return 11;
    if(row == 6) return 10;
-   if(SwSupportsVwap())
-   {
-      if(row == 7) return 13;
-      if(row == 8) return 14;
-      if(row == 9) return 15;
-      if(row == 10) return 16;
-      return row > 10 ? row - 8 : row - 1;
-   }
    return row > 6 ? row - 4 : row - 1;
 }
 
@@ -1742,12 +1738,8 @@ string TableLabelCellText(const int field)
    if(field == 8) return "RSI " + SwTimeframeName();
    if(field == 9) return "DIVERGENCE RSI";
    if(field == 10) return "TENDANCE EMA";
-   if(field == 11) return "INTERPRETATION";
+   if(field == 11) return "FORCE DU SIGNAL";
    if(field == 12) return "ETAT";
-   if(field == 13) return "VWAP";
-   if(field == 14) return "VWAP ORIENTATION";
-   if(field == 15) return "VWAP DISTANCE / ATR";
-   if(field == 16) return "VWAP / SIGNAL";
    return "";
 }
 
@@ -1813,28 +1805,14 @@ string RiskText(const double risk)
    return currency == "" ? text : text + " " + currency;
 }
 
-// ADR = moyenne des ranges high-low des InpAdrPeriod dernières bougies D1 clôturées.
-bool CalculateAdr(double &adr)
-{
-   ENUM_INDICATOR_READ result = ReadAdrBars(1, adr);
-   if(result == INDICATOR_READ_PENDING)
-      ReportDataIssue("ADR courant");
-   return result == INDICATOR_READ_OK;
-}
-
-string AdrText(const double value)
-{
-   if(value == EMPTY_VALUE || !MathIsValidNumber(value) || value <= 0.0)
-      return "n/d";
-   return DoubleToString(value, _Digits);
-}
-
 string TakeProfitText(const int number)
 {
-   double target = EMPTY_VALUE;
-   if(!TargetPrice(LatestEntry1Price, LatestStopPrice, LatestSignalDirection,
-                   LatestSignalAdr, number, target)
-      || LatestSignalDirection * (LatestEntry1Price - LatestStopPrice) <= 0)
+   double target = number == 1 ? LatestTakeProfit1 : LatestTakeProfit2;
+   if((number != 1 && number != 2) || target == EMPTY_VALUE
+      || !MathIsValidNumber(target) || LatestStopPrice == EMPTY_VALUE
+      || !MathIsValidNumber(LatestStopPrice)
+      || LatestSignalDirection * (LatestEntry1Price - LatestStopPrice) <= 0
+      || LatestSignalDirection * (target - LatestEntry1Price) <= 0)
       return "n/d";
    double ratio = LatestSignalDirection * (target - LatestEntry1Price)
                   / MathAbs(LatestEntry1Price - LatestStopPrice);
@@ -1843,15 +1821,17 @@ string TakeProfitText(const int number)
 
 // Suivi théorique : les OHLC ne permettent pas de déterminer l'ordre intrabar.
 string SignalStatus(const int signalIndex, const int direction, const double entry,
-                    const double stop, const double adr, const double &high[], const double &low[])
+                    const double stop, const double tp1, const double tp2,
+                    const double &high[], const double &low[])
 {
    if(signalIndex < 1) return "--";
    if(stop == EMPTY_VALUE || !MathIsValidNumber(stop)
       || !MathIsValidNumber(entry) || direction * (entry - stop) <= 0.0)
       return "n/d (STOP)";
-   double tp1 = EMPTY_VALUE, tp2 = EMPTY_VALUE;
-   bool hasTp1 = TargetPrice(entry, stop, direction, adr, 1, tp1);
-   bool hasTp2 = TargetPrice(entry, stop, direction, adr, 2, tp2);
+   bool hasTp1 = tp1 != EMPTY_VALUE && MathIsValidNumber(tp1)
+                 && direction * (tp1 - entry) > 0.0;
+   bool hasTp2 = tp2 != EMPTY_VALUE && MathIsValidNumber(tp2)
+                 && direction * (tp2 - entry) > 0.0;
    int maxSignalAgeBars = EffectiveMaxSignalAgeBars();
    bool tp1Reached = false;
    for(int bar = signalIndex - 1; bar >= 0; --bar)
@@ -1867,34 +1847,17 @@ string SignalStatus(const int signalIndex, const int direction, const double ent
       if(stopTouched)
          return tp1Reached ? "TP1 ATTEINT / STOP TOUCHÉ" : "STOP TOUCHÉ";
       if(tp2Touched) return "TP2 ATTEINT";
+      if(tp1Touched && !hasTp2) return "TP1 ATTEINT (FINAL)";
       if(tp1Touched) tp1Reached = true;
    }
    if(tp1Reached) return "TP1 ATTEINT";
-   if(!hasTp1 || !hasTp2) return "ACTIF (TP n/d)";
+   if(!hasTp1) return "ACTIF (TP n/d)";
    return "ACTIF";
 }
 
 bool SignalIsActive(const string status)
 {
    return status == "ACTIF" || status == "ACTIF (TP n/d)" || status == "TP1 ATTEINT";
-}
-
-// A partial divergence is evidence of its direction, but not of the absence
-// of the other direction.
-string SwInterpretation(const int direction, const string rsi7, const string rsi14)
-{
-   if(direction == 0) return "--";
-   bool bullish = StringFind(rsi7, "HAUSS.") >= 0 || StringFind(rsi14, "HAUSS.") >= 0;
-   bool bearish = StringFind(rsi7, "BAISS.") >= 0 || StringFind(rsi14, "BAISS.") >= 0;
-   bool incomplete = StringFind(rsi7, "n/d") >= 0 || StringFind(rsi14, "n/d") >= 0
-                     || StringFind(rsi7, "partiel") >= 0 || StringFind(rsi14, "partiel") >= 0;
-   string result;
-   if(bullish && bearish) result = "MIXTE";
-   else if(bullish || bearish)
-      result = ((direction > 0 && bullish) || (direction < 0 && bearish))
-               ? "CONCORDANTE" : "OPPOSEE";
-   else return incomplete ? "n/d" : "AUCUNE";
-   return incomplete ? result + " (partiel)" : result;
 }
 
 bool HasOppositeExit(const int signalIndex, const int direction, const int ratesTotal,
@@ -1907,7 +1870,7 @@ bool HasOppositeExit(const int signalIndex, const int direction, const int rates
       string patternName;
       double stop;
       if(FindConfirmedSignal(bar, ratesTotal, time, open, high, low, close,
-                             false, false, AllowInsideBarForSearch(true),
+                             false, false, false,
                              exitDirection, patternIndex, patternLength, patternName, stop)
          && exitDirection != direction)
          return true;
@@ -1929,11 +1892,6 @@ string TableCellText(const int section, const int row, const int column)
    int field = TableFieldForRow(row);
    if(column == 0) return TableLabelCellText(field);
    if(field == 10) return SwCurrentTrend;
-   if(field == 13) return PriceText(SwVwap);
-   if(field == 14) return SwVwapDirection;
-   if(field == 15) return SwVwapDistanceAtr == EMPTY_VALUE ? "n/d"
-                          : DoubleToString(SwVwapDistanceAtr, 2) + " ATR";
-   if(field == 16) return SwVwapContext();
    if(LatestSignalTime == 0) return "--";
    if(field == 0) return TimeToString(LatestSignalTime, TIME_DATE | TIME_MINUTES);
    if(field == 1) return ShortPatternName(LatestSignalName);
@@ -1945,7 +1903,7 @@ string TableCellText(const int section, const int row, const int column)
    if(field == 7) return TakeProfitText(2);
    if(field == 8) return SwLatestRsi;
    if(field == 9) return SwLatestDivergence;
-   if(field == 11) return SwInterpretation(LatestSignalDirection, SwLatestDiv7, SwLatestDiv14);
+   if(field == 11) return SwLatestSignalStrength;
    if(field == 12) return LatestSignalStatus;
    return "";
 }
@@ -2011,12 +1969,11 @@ void MeasureTableMetrics()
    for(int field = 0; field < FieldCount; ++field)
       if(TextGetSize(TableLabelCellText(field), width, height) && (int)width > labelWidth)
          labelWidth = (int)width;
-   string samples[6] = {"Harami Cross / Étoile filante",
+   string samples[5] = {"Harami Cross / Étoile filante",
                         "SURACHAT (100.0 / 100.0)", "1234567.89 (12.34 R)",
-                        "1234567.89 USD", "7:HAUSS. (partiel) 14:BAISS. (partiel)",
-                        "+123.45 ATR"};
+                        "1234567.89 USD", "7:HAUSS. (partiel) 14:BAISS. (partiel)"};
    int valueWidth = 0;
-   for(int index = 0; index < 6; ++index)
+   for(int index = 0; index < 5; ++index)
       if(TextGetSize(samples[index], width, height) && (int)width > valueWidth)
          valueWidth = (int)width;
    if(labelWidth > 0) TableLabelColumnWidth = labelWidth + 2 * TableTextPaddingX;
@@ -2269,7 +2226,7 @@ int OnInit()
       || InpPinSwingLookbackM15 < 1 || InpPinSwingLookbackM30 < 1
       || InpPinSwingLookbackH1 < 1
       || InpStopBufferPoints < 0.0
-      || InpAtrPeriod < 1 || InpAdrPeriod < 1 || InpAtrMultiplier < 0.0
+      || InpAtrPeriod < 1 || InpAtrMultiplier < 0.0
       || InpMinRangeAtr < 0.0 || InpMaxSignalAgeBars < 0
       || InpMaxSignalAgeBarsM5 < 0 || InpMaxSignalAgeBarsM15 < 0
       || InpMaxSignalAgeBarsM30 < 0 || InpMaxSignalAgeBarsH1 < 0
@@ -2283,40 +2240,39 @@ int OnInit()
       || InpInsideBarMaxRatio <= 0.0)
       return INIT_PARAMETERS_INCORRECT;
 
-   // B2 : mesure des métriques du panneau (repli prudent si échec).
-   MeasureTableMetrics();
-
-   long chartWidth = ChartGetInteger(0, CHART_WIDTH_IN_PIXELS);
-   long chartHeight = ChartGetInteger(0, CHART_HEIGHT_IN_PIXELS);
-   RemoveObsoleteWideTableCells();
-   TableX = (int)chartWidth - TableTotalWidth() - 12;
-   if(TableX < 8)
-      TableX = 8;
-   TableY = (int)chartHeight - TableTotalHeight() - 12;
-   if(TableY < 8)
-      TableY = 8;
-   double savedX, savedY;
-   if(GlobalVariableCheck(TablePositionKey("x"))
-      && GlobalVariableCheck(TablePositionKey("y")))
+   if(!InpInternalBufferOnly)
    {
-      if(GlobalVariableGet(TablePositionKey("x"), savedX)
-         && GlobalVariableGet(TablePositionKey("y"), savedY))
+      MeasureTableMetrics();
+      long chartWidth = ChartGetInteger(0, CHART_WIDTH_IN_PIXELS);
+      long chartHeight = ChartGetInteger(0, CHART_HEIGHT_IN_PIXELS);
+      RemoveObsoleteWideTableCells();
+      TableX = (int)chartWidth - TableTotalWidth() - 12;
+      if(TableX < 8)
+         TableX = 8;
+      TableY = (int)chartHeight - TableTotalHeight() - 12;
+      if(TableY < 8)
+         TableY = 8;
+      double savedX, savedY;
+      if(GlobalVariableCheck(TablePositionKey("x"))
+         && GlobalVariableCheck(TablePositionKey("y")))
       {
-         TableX = (int)MathMax(0, MathMin(savedX, MathMax(0, chartWidth - TableTotalWidth())));
-         TableY = (int)MathMax(0, MathMin(savedY, MathMax(0, chartHeight - TableTotalHeight())));
-         TablePositionCustomized = true;
+         if(GlobalVariableGet(TablePositionKey("x"), savedX)
+            && GlobalVariableGet(TablePositionKey("y"), savedY))
+         {
+            TableX = (int)MathMax(0, MathMin(savedX, MathMax(0, chartWidth - TableTotalWidth())));
+            TableY = (int)MathMax(0, MathMin(savedY, MathMax(0, chartHeight - TableTotalHeight())));
+            TablePositionCustomized = true;
+         }
+         else
+            Print("Impossible de restaurer la position du panneau. Erreur: ", GetLastError());
       }
-      else
-         Print("Impossible de restaurer la position du panneau. Erreur: ", GetLastError());
    }
 
    // C6 : l'ATR est aussi nécessaire au filtre de taille, pas seulement au stop.
    bool atrRequired = InpStopBufferMode == STOP_BUFFER_ATR
                       || InpMinRangeAtr > 0.0;
-   if(atrRequired || (InpShowTable && SwSupportsVwap()))
+   if(atrRequired)
       AtrHandle = iATR(_Symbol, _Period, InpAtrPeriod);
-   if(!atrRequired && InpShowTable && SwSupportsVwap() && AtrHandle == INVALID_HANDLE)
-      Print("ATR du VWAP indisponible. Erreur: ", GetLastError());
    if(atrRequired && AtrHandle == INVALID_HANDLE)
    {
       Print("Impossible de créer les handles RSI/ATR. Erreur: ", GetLastError());
@@ -2333,14 +2289,28 @@ int OnInit()
 
    SetIndexBuffer(0, BullishBuffer, INDICATOR_DATA);
    SetIndexBuffer(1, BearishBuffer, INDICATOR_DATA);
+   SetIndexBuffer(2, SignalEntryBuffer, INDICATOR_DATA);
+   SetIndexBuffer(3, SignalStopBuffer, INDICATOR_DATA);
+   SetIndexBuffer(4, SignalTp1Buffer, INDICATOR_DATA);
+   SetIndexBuffer(5, SignalTp2Buffer, INDICATOR_DATA);
+   SetIndexBuffer(6, SignalForceBuffer, INDICATOR_DATA);
    ArraySetAsSeries(BullishBuffer, true);
    ArraySetAsSeries(BearishBuffer, true);
+   ArraySetAsSeries(SignalEntryBuffer, true);
+   ArraySetAsSeries(SignalStopBuffer, true);
+   ArraySetAsSeries(SignalTp1Buffer, true);
+   ArraySetAsSeries(SignalTp2Buffer, true);
+   ArraySetAsSeries(SignalForceBuffer, true);
    PlotIndexSetInteger(0, PLOT_ARROW, 233);
    PlotIndexSetInteger(1, PLOT_ARROW, 234);
    PlotIndexSetDouble(0, PLOT_EMPTY_VALUE, EMPTY_VALUE);
    PlotIndexSetDouble(1, PLOT_EMPTY_VALUE, EMPTY_VALUE);
+   for(int plot = 2; plot < 7; ++plot)
+      PlotIndexSetDouble(plot, PLOT_EMPTY_VALUE, EMPTY_VALUE);
    IndicatorSetInteger(INDICATOR_DIGITS, _Digits);
    IndicatorSetString(INDICATOR_SHORTNAME, "silentwolfforex");
+   if(InpInternalBufferOnly)
+      return INIT_SUCCEEDED;
    Print("PinBarFusion : les signaux historiques sont recalculés avec les zones actuelles ; "
          "ils ne prouvent pas qu'une zone existait au moment du signal.");
 
@@ -2406,6 +2376,37 @@ int OnCalculate(const int rates_total, const int prev_calculated,
    ArraySetAsSeries(low, true);
    ArraySetAsSeries(close, true);
 
+   if(!SwSupportsSignals())
+   {
+      if(prev_calculated == 0)
+      {
+         ArrayInitialize(BullishBuffer, EMPTY_VALUE);
+         ArrayInitialize(BearishBuffer, EMPTY_VALUE);
+         ArrayInitialize(SignalEntryBuffer, EMPTY_VALUE);
+         ArrayInitialize(SignalStopBuffer, EMPTY_VALUE);
+         ArrayInitialize(SignalTp1Buffer, EMPTY_VALUE);
+         ArrayInitialize(SignalTp2Buffer, EMPTY_VALUE);
+         ArrayInitialize(SignalForceBuffer, EMPTY_VALUE);
+      }
+      for(int bar = 0; bar < 2; ++bar)
+      {
+         BullishBuffer[bar] = EMPTY_VALUE;
+         BearishBuffer[bar] = EMPTY_VALUE;
+         SignalEntryBuffer[bar] = EMPTY_VALUE;
+         SignalStopBuffer[bar] = EMPTY_VALUE;
+         SignalTp1Buffer[bar] = EMPTY_VALUE;
+         SignalTp2Buffer[bar] = EMPTY_VALUE;
+         SignalForceBuffer[bar] = EMPTY_VALUE;
+      }
+      if(prev_calculated == 0 || LastBarTime != time[0])
+      {
+         LastBarTime = time[0];
+         SwRefreshInfo();
+         if(InpShowTable && !InpInternalBufferOnly) UpdateSignalTable();
+      }
+      return rates_total;
+   }
+
    bool firstCalculation = LastBarTime == 0;
    bool newBar = !firstCalculation && time[0] != LastBarTime;
    // C8 : l'alerte de la barre est mémorisée dès sa détection. Elle n'est
@@ -2432,7 +2433,8 @@ int OnCalculate(const int rates_total, const int prev_calculated,
       else if(LatestSignalStatus != "SORTIE CONTRAIRE")
       {
          string status = SignalStatus(shift, LatestSignalDirection, LatestEntry1Price,
-                                      LatestStopPrice, LatestSignalAdr, high, low);
+                                      LatestStopPrice, LatestTakeProfit1,
+                                      LatestTakeProfit2, high, low);
          if(status != LatestSignalStatus)
          {
             LatestSignalStatus = status;
@@ -2441,7 +2443,7 @@ int OnCalculate(const int rates_total, const int prev_calculated,
                ActiveSignalDirection = 0;
                ActiveSignalTime = 0;
             }
-            if(InpShowTable) UpdateSignalTable();
+            if(InpShowTable && !InpInternalBufferOnly) UpdateSignalTable();
          }
       }
    }
@@ -2471,6 +2473,8 @@ int OnCalculate(const int rates_total, const int prev_calculated,
    double previousEntry = LatestEntry1Price;
    double previousRisk = LatestEntry1Risk;
    double previousStop = LatestStopPrice;
+   double previousTakeProfit1 = LatestTakeProfit1;
+   double previousTakeProfit2 = LatestTakeProfit2;
 
    if(fullRecalculation)
    {
@@ -2483,6 +2487,11 @@ int OnCalculate(const int rates_total, const int prev_calculated,
       }
       ArrayInitialize(BullishBuffer, EMPTY_VALUE);
       ArrayInitialize(BearishBuffer, EMPTY_VALUE);
+      ArrayInitialize(SignalEntryBuffer, EMPTY_VALUE);
+      ArrayInitialize(SignalStopBuffer, EMPTY_VALUE);
+      ArrayInitialize(SignalTp1Buffer, EMPTY_VALUE);
+      ArrayInitialize(SignalTp2Buffer, EMPTY_VALUE);
+      ArrayInitialize(SignalForceBuffer, EMPTY_VALUE);
    }
    else
    {
@@ -2491,12 +2500,24 @@ int OnCalculate(const int rates_total, const int prev_calculated,
       {
          BullishBuffer[previousShift] = EMPTY_VALUE;
          BearishBuffer[previousShift] = EMPTY_VALUE;
+         SignalEntryBuffer[previousShift] = EMPTY_VALUE;
+         SignalStopBuffer[previousShift] = EMPTY_VALUE;
+         SignalTp1Buffer[previousShift] = EMPTY_VALUE;
+         SignalTp2Buffer[previousShift] = EMPTY_VALUE;
+         SignalForceBuffer[previousShift] = EMPTY_VALUE;
       }
-      int clearUpperBound = MathMin(rates_total - 1, oldestSignalIndex + 1);
+      // Seul le dernier signal est publié ; le nouvel emplacement et sa
+      // barre précédente suffisent en plus de previousShift ci-dessus.
+      int clearUpperBound = MathMin(rates_total - 1, 1);
       for(int index = 0; index <= clearUpperBound; ++index)
       {
          BullishBuffer[index] = EMPTY_VALUE;
          BearishBuffer[index] = EMPTY_VALUE;
+         SignalEntryBuffer[index] = EMPTY_VALUE;
+         SignalStopBuffer[index] = EMPTY_VALUE;
+         SignalTp1Buffer[index] = EMPTY_VALUE;
+         SignalTp2Buffer[index] = EMPTY_VALUE;
+         SignalForceBuffer[index] = EMPTY_VALUE;
       }
    }
    // C8 : la barre est acquise, l'horodatage peut avancer.
@@ -2508,7 +2529,7 @@ int OnCalculate(const int rates_total, const int prev_calculated,
    if(firstCalculation)
    {
       LastEntryAlertBarTime = time[1];
-      LastExitAlertBarTime = time[1];
+      LastExitProcessedBarTime = time[1];
    }
    SignalsDirty = false;
    IndicatorDataPending = false;
@@ -2519,8 +2540,9 @@ int OnCalculate(const int rates_total, const int prev_calculated,
    LatestSignalDirection = 0;
    LatestSignalName = "";
    LatestStopPrice = EMPTY_VALUE;
+   LatestTakeProfit1 = EMPTY_VALUE;
+   LatestTakeProfit2 = EMPTY_VALUE;
    int latestSignalIndex = -1;
-   LatestSignalAdr = EMPTY_VALUE;
    if(fullRecalculation)
    {
       ArrayInitialize(RejectedByReason, 0);
@@ -2542,7 +2564,8 @@ int OnCalculate(const int rates_total, const int prev_calculated,
    datetime latestActiveTime = 0;
    int latestActiveDirection = 0;
 
-   for(int i = oldestSignalIndex; i >= 1; --i)
+   int searchOldestIndex = OldestZoneSignalIndex(oldestSignalIndex, time);
+   for(int i = searchOldestIndex; i >= 1; --i)
    {
       int pivotIndex = i + InpSwingLookbackBars;
       if(bullishSwingSignalUsed
@@ -2558,11 +2581,11 @@ int OnCalculate(const int rates_total, const int prev_calculated,
       string patternName;
       double signalStopPrice;
       // P1 : recherche d'ENTRÉE -> requireZone = true, applyStopCheck = true.
-      // A6 : inside bar admise selon InpEnableInsideBar.
+      // Les inside bars sont toujours admises en entrée.
       CandidateRejection = REJECT_NONE;
       CandidatePatternFound = false;
       bool accepted = FindConfirmedSignal(i, rates_total, time, open, high, low, close,
-                                          true, true, AllowInsideBarForSearch(false),
+                                          true, true, true,
                                           direction, patternIndex, patternLength,
                                           patternName, signalStopPrice);
       if(fullRecalculation && CandidatePatternFound)
@@ -2619,10 +2642,12 @@ int OnCalculate(const int rates_total, const int prev_calculated,
                                  && (maxAge <= 0 || i - 1 <= maxAge);
       if(trackCandidate || initializeCandidate)
       {
-         double candidateAdr = EMPTY_VALUE;
-         AdrAtSignal(time[i - 1], candidateAdr);
+         double candidateTp1 = EMPTY_VALUE;
+         double candidateTp2 = EMPTY_VALUE;
+         ContextTargetsAtSignal(entry1, stopPrice, direction, time[i - 1],
+                                candidateTp1, candidateTp2);
          string candidateStatus = SignalStatus(i, direction, entry1, stopPrice,
-                                               candidateAdr, high, low);
+                                               candidateTp1, candidateTp2, high, low);
          if(trackCandidate)
          {
             trackedSignalFound = true;
@@ -2655,15 +2680,18 @@ int OnCalculate(const int rates_total, const int prev_calculated,
       LatestEntry1Price = previousEntry;
       LatestEntry1Risk = previousRisk;
       LatestStopPrice = previousStop;
+      LatestTakeProfit1 = previousTakeProfit1;
+      LatestTakeProfit2 = previousTakeProfit2;
    }
    if(latestSignalIndex >= 1)
    {
-      ENUM_INDICATOR_READ adrRead = AdrAtSignal(time[latestSignalIndex - 1], LatestSignalAdr);
-      if(adrRead == INDICATOR_READ_PENDING)
-         ReportDataIssue("ADR du dernier signal");
+      ContextTargetsAtSignal(LatestEntry1Price, LatestStopPrice, LatestSignalDirection,
+                             time[latestSignalIndex - 1],
+                             LatestTakeProfit1, LatestTakeProfit2);
       LatestSignalStatus = SignalStatus(latestSignalIndex, LatestSignalDirection,
                                         LatestEntry1Price, LatestStopPrice,
-                                        LatestSignalAdr, high, low);
+                                        LatestTakeProfit1, LatestTakeProfit2,
+                                        high, low);
       if(SignalIsActive(LatestSignalStatus)
          && HasOppositeExit(latestSignalIndex, LatestSignalDirection, rates_total,
                             time, open, high, low, close))
@@ -2698,7 +2726,7 @@ int OnCalculate(const int rates_total, const int prev_calculated,
    }
 
    SwRefreshInfo();
-   UpdateSignalTable();
+   if(!InpInternalBufferOnly) UpdateSignalTable();
 
    // C8 : PendingNewBarAlert est consommé ici, après un recalcul complet.
    PendingNewBarAlert = false;
@@ -2707,37 +2735,25 @@ int OnCalculate(const int rates_total, const int prev_calculated,
    // P3 (a) étendu à la SORTIE : l'évaluation de sortie n'est plus
    // conditionnée par PendingNewBarAlert mais par la barre de confirmation
    // déjà traitée. L'évaluation est idempotente.
-   if(LastExitAlertBarTime != time[confirmationIndex])
+   if(LastExitProcessedBarTime != time[confirmationIndex])
    {
       int direction, patternIndex, patternLength;
       string patternName;
       double alertStopPrice;
 
       // P1 : recherche de SORTIE -> requireZone = false ET
-      // applyStopCheck = false. A6 : inside bar admise selon
-      // InpEnableInsideBar && InpInsideBarUseForExit. F1 : la direction de
-      // l'inside bar est résolue par le même correctif dans
-      // FindConfirmedSignal, donc le chemin de SORTIE est cohérent.
+      // applyStopCheck = false. Les inside bars ne déclenchent pas de sortie.
       bool confirmedPattern = FindConfirmedSignal(confirmationIndex, rates_total,
                                                    time, open, high, low, close,
                                                    false, false,
-                                                   AllowInsideBarForSearch(true),
+                                                   false,
                                                    direction, patternIndex,
                                                    patternLength, patternName,
                                                    alertStopPrice);
       if(confirmedPattern && ActiveSignalDirection != 0
          && direction != ActiveSignalDirection)
       {
-         // P3 : une seule alerte de SORTIE par barre de confirmation.
-         LastExitAlertBarTime = time[confirmationIndex];
-         string exitSide = ActiveSignalDirection > 0 ? "achat" : "vente";
-         // A7 : nom affiché (libellé dirigé pour l'inside bar).
-         string exitPatternLabel = SignalDisplayName(patternName, direction);
-         string message = StringFormat("SORTIE %s: signal contraire %s sur %s (%s), entrée suivie depuis %s",
-                                       exitSide, exitPatternLabel, _Symbol,
-                                       EnumToString((ENUM_TIMEFRAMES)_Period),
-                                       TimeToString(ActiveSignalTime, TIME_DATE | TIME_MINUTES));
-         RaiseAlert(message);
+         LastExitProcessedBarTime = time[confirmationIndex];
          ActiveSignalDirection = 0;
          ActiveSignalTime = 0;
       }
@@ -2759,7 +2775,7 @@ int OnCalculate(const int rates_total, const int prev_calculated,
       LastEntryAlertBarTime = time[confirmationIndex];
       // P3 : l'entrée de cette barre est traitée, la question de la sortie
       // de la même barre est réglée.
-      LastExitAlertBarTime = time[confirmationIndex];
+      LastExitProcessedBarTime = time[confirmationIndex];
       EntryAlertArmedBarTime = 0;
       int direction = currentBarEntryDirection;
       string patternName = currentBarEntryName;
@@ -2789,7 +2805,7 @@ int OnCalculate(const int rates_total, const int prev_calculated,
                                     side, patternLabel, _Symbol,
                                     EnumToString((ENUM_TIMEFRAMES)_Period),
                                     rsi7Text, rsi14Text, rsiStatus);
-      RaiseAlert(message);
+      if(!InpInternalBufferOnly) RaiseAlert(message);
    }
 
    if(latestSignalIndex >= 1)
@@ -2798,6 +2814,11 @@ int OnCalculate(const int rates_total, const int prev_calculated,
          BullishBuffer[latestSignalIndex] = low[latestSignalIndex] - InpArrowOffsetPoints * _Point;
       else
          BearishBuffer[latestSignalIndex] = high[latestSignalIndex] + InpArrowOffsetPoints * _Point;
+      SignalEntryBuffer[latestSignalIndex] = LatestEntry1Price;
+      SignalStopBuffer[latestSignalIndex] = LatestStopPrice;
+      SignalTp1Buffer[latestSignalIndex] = LatestTakeProfit1;
+      SignalTp2Buffer[latestSignalIndex] = LatestTakeProfit2;
+      SignalForceBuffer[latestSignalIndex] = SwLatestSignalStrengthValue;
    }
 
    // C-R1 : consommation de l'armement quand la passe s'achève sans alerte
@@ -2834,8 +2855,9 @@ int OnCalculate(const int rates_total, const int prev_calculated,
 void OnChartEvent(const int id, const long &lparam,
                   const double &dparam, const string &sparam)
 {
-   DrawingChartEvent(id, lparam, dparam, sparam);
-   if(id == CHARTEVENT_OBJECT_DRAG && sparam == TableHandleName)
+   if(!InpInternalBufferOnly)
+      DrawingChartEvent(id, lparam, dparam, sparam);
+   if(!InpInternalBufferOnly && id == CHARTEVENT_OBJECT_DRAG && sparam == TableHandleName)
    {
       TableX = (int)ObjectGetInteger(0, TableHandleName, OBJPROP_XDISTANCE);
       TableY = (int)ObjectGetInteger(0, TableHandleName, OBJPROP_YDISTANCE);
@@ -2860,7 +2882,7 @@ void OnChartEvent(const int id, const long &lparam,
       return;
    }
 
-   if(id == CHARTEVENT_CHART_CHANGE)
+   if(!InpInternalBufferOnly && id == CHARTEVENT_CHART_CHANGE)
    {
       long chartWidth = ChartGetInteger(0, CHART_WIDTH_IN_PIXELS);
       long chartHeight = ChartGetInteger(0, CHART_HEIGHT_IN_PIXELS);
@@ -2918,6 +2940,12 @@ void OnDeinit(const int reason)
 {
    EventKillTimer();
    SwReleaseHandles();
+   if(InpInternalBufferOnly)
+   {
+      if(AtrHandle != INVALID_HANDLE)
+         IndicatorRelease(AtrHandle);
+      return;
+   }
    ObjectsDeleteAll(0, SessionObjectPrefix);
    DrawingDeinit();
    // P5 : on ne restaure QUE ce que cet indicateur a lui-même forcé dans
@@ -3240,8 +3268,13 @@ void SnapObject(const string name)
 bool CreateToolButton(const int index)
 {
    string name = ButtonName(index);
-   if(!ObjectCreate(0, name, OBJ_BUTTON, 0, 0, 0))
+   if(ObjectFind(0, name) < 0 && !ObjectCreate(0, name, OBJ_BUTTON, 0, 0, 0))
       return false;
+   if((ENUM_OBJECT)ObjectGetInteger(0, name, OBJPROP_TYPE) != OBJ_BUTTON)
+   {
+      Print("Objet incompatible avec le bouton de dessin : ", name);
+      return false;
+   }
 
    int row = index / 2;
    int column = index % 2;
@@ -3370,7 +3403,6 @@ void OnTimer()
 {
    DrawTradingSessions();
    SwRefreshInfo();
-   SwUpdateVwap();
    if(InpShowTable) UpdateSignalTable();
 }
 
@@ -3409,8 +3441,8 @@ void DrawTradingSession(const string name, const int startH, const int endH, con
 
       datetime t2c = (t2 > now) ? now : t2;
       double hi[], lo[];
-      int n = CopyHigh(_Symbol, _Period, t1, t2c, hi);
-      if(n <= 0 || CopyLow(_Symbol, _Period, t1, t2c, lo) <= 0)
+      int n = CopyHigh(_Symbol, PERIOD_M5, t1, t2c, hi);
+      if(n <= 0 || CopyLow(_Symbol, PERIOD_M5, t1, t2c, lo) <= 0)
          continue;
 
       double top = hi[ArrayMaximum(hi)];

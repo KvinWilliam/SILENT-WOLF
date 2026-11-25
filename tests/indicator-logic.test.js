@@ -8,9 +8,10 @@ const paths = [
   "MQL5/Indicators/Forex/silentwolfforex.mq5",
   "MQL5/Indicators/SyntheticIndices/silentwolfindices.mq5",
 ];
+const robotSource = fs.readFileSync("MQL5/Experts/SWRobots.mq5", "utf8").replace(/\r\n/g, "\n");
 
 function extract(source, name) {
-  const start = source.search(new RegExp("\\b(?:string|bool|int|void) " + name + "\\("));
+  const start = source.search(new RegExp("\\b(?:string|bool|int|double|void) " + name + "\\("));
   assert(start >= 0, name + " missing");
   const open = source.indexOf("{", start);
   let depth = 1;
@@ -25,22 +26,19 @@ function extract(source, name) {
 
 function translate(code) {
   return code
-    .replace(/\b(?:string|bool|int|void)\s+(\w+)\(([^)]*)\)/,
+    .replace(/\b(?:string|bool|int|double|void)\s+(\w+)\(([^)]*)\)/,
       (_, name, args) => "function " + name + "(" +
         args.replace(/\bconst\s+/g, "")
           .replace(/\b(?:int|double|string|datetime)\s*&?\s*/g, "")
           .replace(/\[\]/g, "") + ")")
     .replace(/\b(?:bool|string|int|double|datetime)\s+/g, "let ")
-    .replace(/TargetPrice\(entry, stop, direction, adr, 1, tp1\)/g,
-      "((tp1 = target1), target1 !== null)")
-    .replace(/TargetPrice\(entry, stop, direction, adr, 2, tp2\)/g,
-      "((tp2 = target2), target2 !== null)")
+    .replace(/\((?:int|double)\)/g, "")
     .replace(/FindConfirmedSignal\(bar,[\s\S]*?patternName, stop\)/,
       "((exitDirection = exits[bar] || 0), exitDirection !== 0)");
 }
 
-function runSelection(source, candidates, statuses, previousShift = -1, exits = {}) {
-  const start = source.indexOf("   for(int i = oldestSignalIndex; i >= 1; --i)");
+function runSelection(source, candidates, statuses, previousShift = -1, exits = {}, hasZones = true) {
+  const start = source.indexOf("   for(int i = searchOldestIndex; i >= 1; --i)");
   const end = source.indexOf('   if(fullRecalculation)\n      PrintFormat("SilentWolf : patterns=', start);
   assert(start >= 0 && end > start);
   const selection = source.slice(start, end)
@@ -48,9 +46,15 @@ function runSelection(source, candidates, statuses, previousShift = -1, exits = 
       `bool accepted = (([direction, patternIndex, patternLength, patternName, signalStopPrice] =
         candidates[i] || [0, 0, 0, "", 0]), !!candidates[i]);`)
     .replace(/\(int\)/g, "")
+    .replace(/ContextTargetsAtSignal\(entry1, stopPrice, direction, time\[i - 1\],\s*candidateTp1, candidateTp2\);/,
+      "candidateTp1 = target1; candidateTp2 = target2;")
+    .replace(/ContextTargetsAtSignal\(LatestEntry1Price,[\s\S]*?LatestTakeProfit2\);/,
+      "LatestTakeProfit1 = target1; LatestTakeProfit2 = target2;")
+    .replace(/\(double\)/g, "")
     .replace(/\b(?:ENUM_INDICATOR_READ|datetime|bool|string|int|double)\s+/g, "let ");
   const context = {
-    candidates, statuses, exits, EMPTY_VALUE: Infinity,
+    candidates, statuses, exits, EMPTY_VALUE: Infinity, target1: 110, target2: 130,
+    ChartZones: hasZones ? [{}] : [], ArraySize: values => values.length,
     time: Array.from({ length: 20 }, (_, i) => 100 - i),
     open: [], high: [], low: [], close: Array(20).fill(100),
     InpSwingLookbackBars: 1, rates_total: 20, oldestSignalIndex: 4, previousShift,
@@ -61,7 +65,7 @@ function runSelection(source, candidates, statuses, previousShift = -1, exits = 
     PositionStateInitialized: true, REJECT_NONE: 0, INDICATOR_READ_PENDING: 1,
     IsConfirmedSwingPivot: () => true, EstimateLoss: () => 1,
     EffectiveMaxSignalAgeBars: () => 1,
-    AdrAtSignal: () => 0, ReportDataIssue: () => {},
+    ReportDataIssue: () => {},
     SignalStatus: index => statuses[index],
     SignalIsActive: status => status === "ACTIF" || status === "TP1 ATTEINT",
     HasOppositeExit: index => !!exits[index],
@@ -76,8 +80,12 @@ function runSelection(source, candidates, statuses, previousShift = -1, exits = 
     let trackedSignalFound = false, trackedSignalActive = false;
     let latestActiveTime = 0, latestActiveDirection = 0;
     let latestSignalIndex = -1, LatestSignalTime = 0, LatestSignalDirection = 0;
+    let searchOldestIndex = ChartZones.length ? oldestSignalIndex : 0;
     let LatestEntry1Price = 0, LatestEntry1Risk = EMPTY_VALUE, LatestStopPrice = EMPTY_VALUE;
-    let LatestSignalName = "", LatestSignalAdr = EMPTY_VALUE, LatestSignalStatus = "--";
+    let LatestTakeProfit1 = target1, LatestTakeProfit2 = target2;
+    let previousTakeProfit1 = target1, previousTakeProfit2 = target2;
+    let LatestSignalName = "";
+    let LatestSignalStatus = "--";
     let CandidateRejection = 0, CandidatePatternFound = false, fullRecalculation = false;
     ${selection}
     result = { index: latestSignalIndex, time: LatestSignalTime,
@@ -89,14 +97,27 @@ function runSelection(source, candidates, statuses, previousShift = -1, exits = 
 let baseline;
 for (const path of paths) {
   const source = fs.readFileSync(path, "utf8").replace(/\r\n/g, "\n");
-  const bodies = ["SignalStatus", "SignalIsActive", "SwInterpretation",
+  const bodies = ["SwSupportsSignals", "SwTrendAt", "ContextTargetPrice", "SignalStatus", "SignalIsActive", "SwSignalStrengthScore",
     "HasOppositeExit", "DisplayedSignalIndex", "TableFieldForRow",
-    "TableCellText", "SwRefreshInfo"].map(name => extract(source, name));
+    "TableLabelCellText", "TableCellText", "SwRefreshInfo"].map(name => extract(source, name));
   if (baseline) assert.deepEqual(bodies, baseline);
   else baseline = bodies;
 
   const context = {
     EMPTY_VALUE: Infinity,
+    InpRsiOversold: 20,
+    InpRsiOverbought: 80,
+    _Point: 0.00001,
+    _Digits: 5,
+    SYMBOL_TRADE_TICK_SIZE: 1,
+    tickSize: 0.00001,
+    SymbolInfoDouble: () => context.tickSize,
+    ReportDataIssue: () => { context.dataIssue = true; },
+    MathCeil: Math.ceil,
+    MathFloor: Math.floor,
+    NormalizeDouble: (value, digits) => Number(value.toFixed(digits)),
+    ArraySize: values => values.length,
+    MathAbs: Math.abs,
     StringFind: (text, part) => text.indexOf(part),
     MathIsValidNumber: Number.isFinite,
     EffectiveMaxSignalAgeBars: () => context.maxAge,
@@ -107,19 +128,20 @@ for (const path of paths) {
     SwLatestDivergence: "n/d",
     SwLatestDiv7: "n/d",
     SwLatestDiv14: "n/d",
-    SwVwap: 100,
-    SwVwapDirection: "HAUSSIER",
-    SwVwapDistanceAtr: 1.25,
-    SwVwapContext: () => "n/d",
-    SwSupportsVwap: () => context.supportsVwap,
-    supportsVwap: true,
+    SwLatestSignalStrength: "n/d",
     DoubleToString: (value, digits) => value.toFixed(digits),
     TableLabelCellText: () => "LABEL",
     PriceText: value => value === Infinity ? "n/d" : String(value),
-    SwTrendAt: shift => shift === 1 ? "HAUSSIERE" : "incorrect",
+    SwEma: [0, 1, 2],
+    emaValues: [3, 2, 1],
+    historyBars: 250,
+    Bars: () => context.historyBars,
+    SwRead: () => true,
     iBarShift: () => -1,
     _Symbol: "TEST",
     _Period: 1,
+    PERIOD_M5: 5, PERIOD_M15: 15, PERIOD_M30: 30,
+    PERIOD_H1: 60, PERIOD_H4: 240,
     maxAge: 6,
     target1: 110,
     target2: 130,
@@ -128,21 +150,62 @@ for (const path of paths) {
   vm.createContext(context);
   vm.runInContext(bodies.map(translate).join("\n"), context);
 
-  const interpretation = context.SwInterpretation;
-  assert.equal(interpretation(0, "HAUSS.", "HAUSS."), "--");
-  assert.equal(interpretation(1, "HAUSS.", "AUCUNE"), "CONCORDANTE");
-  assert.equal(interpretation(-1, "HAUSS.", "AUCUNE"), "OPPOSEE");
-  assert.equal(interpretation(-1, "BAISS.", "AUCUNE"), "CONCORDANTE");
-  assert.equal(interpretation(1, "HAUSS.", "BAISS."), "MIXTE");
-  assert.equal(interpretation(1, "HAUSS.+BAISS.", "AUCUNE"), "MIXTE");
-  assert.equal(interpretation(1, "AUCUNE", "AUCUNE"), "AUCUNE");
-  assert.equal(interpretation(1, "n/d", "AUCUNE"), "n/d");
-  assert.equal(interpretation(1, "HAUSS.", "n/d"), "CONCORDANTE (partiel)");
-  assert.equal(interpretation(-1, "HAUSS. (partiel)", "AUCUNE"), "OPPOSEE (partiel)");
-  assert.equal(interpretation(1, "HAUSS. (partiel)", "BAISS."), "MIXTE (partiel)");
+  for (const period of [5, 15, 30, 60, 240]) {
+    context._Period = period;
+    assert.equal(context.SwSupportsSignals(), true);
+  }
+  for (const period of [1, 1440, 10080, 43200]) {
+    context._Period = period;
+    assert.equal(context.SwSupportsSignals(), false);
+  }
+  // Test actual monthly trend evaluation with enough and insufficient history.
+  context._Period = 43200;
+  const trendBody = translate(extract(source, "SwTrendAt"))
+    .replace("SwRead(SwEma[0], shift, a)", "(a = emaValues[0], true)")
+    .replace("SwRead(SwEma[1], shift, b)", "(b = emaValues[1], true)")
+    .replace("SwRead(SwEma[2], shift, c)", "(c = emaValues[2], true)");
+  vm.runInContext(trendBody, context);
+  assert.equal(context.SwTrendAt(1), "HAUSSIERE");
+  context.emaValues = [1, 2, 3];
+  assert.equal(context.SwTrendAt(1), "BAISSIERE");
+  context.historyBars = 201;
+  assert.equal(context.SwTrendAt(1), "n/d");
+  context.historyBars = 250;
+  context.emaValues = [3, 2, 1];
+  context._Period = 1;
+  const target = context.ContextTargetPrice;
+  assert.equal(target(100, 98, 1, [103, 105, 104, 100, 99, Infinity], 1), 104);
+  assert.equal(target(100, 98, 1, [103, 105, 104, 100, 99, Infinity], 2), 105);
+  assert.equal(target(100, 102, -1, [103, 95, 101, 100, 96, 97], 1), 96);
+  assert.equal(target(100, 102, -1, [103, 95, 101, 100, 96, 97], 2), 95);
+  assert.equal(target(100, 98, 1, [104, 104, 103, Infinity], 1), 104);
+  assert.equal(target(100, 98, 1, [104, 104, 103, Infinity], 2), Infinity);
+  assert.equal(target(100, 98, 1, [103, 99, Infinity], 1), 104);
+  assert.equal(target(100, 102, -1, [97, 101, Infinity], 1), 96);
+  assert.equal(target(100, 98, 1, [103, 99, Infinity], 2), Infinity);
+  assert.equal(target(100, 100, 1, [104], 1), Infinity);
+  context.tickSize = 0.1;
+  context._Digits = 2;
+  assert.equal(target(100.01, 99.96, 1, [], 1), 100.2);
+  assert.equal(target(99.99, 100.04, -1, [], 1), 99.8);
+  context.tickSize = 0;
+  context.dataIssue = false;
+  assert.equal(target(100, 98, 1, [], 1), Infinity);
+  assert.equal(context.dataIssue, true);
+  context.tickSize = 0.00001;
+  context._Digits = 5;
+
+  const strength = context.SwSignalStrengthScore;
+  assert.equal(strength(1, 20, 10, "HAUSS.", "HAUSS."), 100);
+  assert.equal(strength(-1, 80, 90, "BAISS.", "BAISS."), 100);
+  assert.equal(strength(1, 19, 21, "AUCUNE", "AUCUNE"), 70);
+  assert.equal(strength(1, 21, 21, "HAUSS.", "BAISS."), 55);
+  assert.equal(strength(1, 10, 10, "n/d", "BAISS. (partiel)"), 70);
+  assert.equal(strength(1, Infinity, 10, "HAUSS.", "HAUSS."), 85);
+  assert.equal(strength(0, 10, 10, "HAUSS.", "HAUSS."), 0);
 
   const status = (high, low, index = 1) =>
-    context.SignalStatus(index, 1, 100, 90, 10, high, low);
+    context.SignalStatus(index, 1, 100, 90, context.target1, context.target2, high, low);
   assert.equal(status([105], [95]), "ACTIF");
   assert.equal(status([110], [95]), "TP1 ATTEINT");
   assert.equal(status([130], [95]), "TP2 ATTEINT");
@@ -154,14 +217,17 @@ for (const path of paths) {
   assert.equal(status([105], [95]), "ACTIF (TP n/d)");
   assert.equal(context.SignalIsActive(status([105], [95])), true);
   context.target1 = 110;
+  assert.equal(status([105], [95]), "ACTIF");
+  assert.equal(status([110], [95]), "TP1 ATTEINT (FINAL)");
+  context.target1 = 110;
   context.target2 = 130;
   context.maxAge = 1;
   assert.equal(status([105, 105], [95, 95], 2), "ACTIF");
   assert.equal(status([105, 105, 105], [95, 95, 95], 3), "PÉRIMÉ");
   context.target1 = 90;
   context.target2 = 70;
-  assert.equal(context.SignalStatus(1, -1, 100, 110, 10, [105], [90]), "TP1 ATTEINT");
-  assert.equal(context.SignalStatus(1, -1, 100, 110, 10, [110], [70]), "ORDRE INTRABAR INCONNU");
+  assert.equal(context.SignalStatus(1, -1, 100, 110, 90, 70, [105], [90]), "TP1 ATTEINT");
+  assert.equal(context.SignalStatus(1, -1, 100, 110, 90, 70, [110], [70]), "ORDRE INTRABAR INCONNU");
 
   context.exits = { 2: 1 };
   assert.equal(context.HasOppositeExit(4, 1), false);
@@ -187,22 +253,123 @@ for (const path of paths) {
     { index: 1, time: 99, direction: -1, status: "SORTIE CONTRAIRE" });
   assert.deepEqual(runSelection(source, {}, {}, -1),
     { index: -1, time: 0, direction: 0, status: "--" });
-  assert.deepEqual(Array.from({ length: 17 }, (_, i) => context.TableFieldForRow(i + 1)),
-    [0, 1, 2, 12, 11, 10, 13, 14, 15, 16, 3, 4, 5, 6, 7, 8, 9]);
-  context.SwRefreshInfo();
-  assert.equal(context.TableCellText(0, 6, 1), "HAUSSIERE");
-  assert.equal(context.TableCellText(0, 7, 1), "100");
-  assert.equal(context.TableCellText(0, 8, 1), "HAUSSIER");
-  assert.equal(context.TableCellText(0, 9, 1), "1.25 ATR");
-  assert.equal(context.TableCellText(0, 1, 1), "--");
-  context.SwVwap = context.SwVwapDistanceAtr = Infinity;
-  assert.equal(context.TableCellText(0, 7, 1), "n/d");
-  assert.equal(context.TableCellText(0, 9, 1), "n/d");
-  context.supportsVwap = false;
+  assert.deepEqual(runSelection(source, { 1: recent }, { 1: "ACTIF" }, -1, {}, false),
+    { index: -1, time: 0, direction: 0, status: "--" });
   assert.deepEqual(Array.from({ length: 13 }, (_, i) => context.TableFieldForRow(i + 1)),
     [0, 1, 2, 12, 11, 10, 3, 4, 5, 6, 7, 8, 9]);
+  context.SwRefreshInfo();
+  assert.equal(context.TableLabelCellText(11), "FORCE DU SIGNAL");
+  assert.equal(context.SwLatestSignalStrength, "n/d");
+  context.LatestSignalTime = 123;
+  context.SwLatestSignalStrength = "85%";
+  assert.equal(context.TableCellText(0, 5, 1), "85%");
+  context.LatestSignalTime = 0;
+  assert.equal(context.TableCellText(0, 6, 1), "HAUSSIERE");
+  assert.equal(context.TableCellText(0, 1, 1), "--");
+  assert(!/VWAP|Vwap|vwap/.test(source));
   assert.equal((source.match(/BullishBuffer\[latestSignalIndex\] =/g) || []).length, 1);
   assert.equal((source.match(/BearishBuffer\[latestSignalIndex\] =/g) || []).length, 1);
+  assert(source.includes("#property indicator_buffers 7"));
+  assert(source.includes("#property indicator_plots   7"));
+  assert.equal((source.match(/SetIndexBuffer\([0-6],/g) || []).length, 7);
+  assert(source.includes("SignalEntryBuffer[latestSignalIndex] = LatestEntry1Price;"));
+  assert(source.includes("SignalStopBuffer[latestSignalIndex] = LatestStopPrice;"));
+  assert(source.includes("SignalTp1Buffer[latestSignalIndex] = LatestTakeProfit1;"));
+  assert(source.includes("SignalTp2Buffer[latestSignalIndex] = LatestTakeProfit2;"));
+  assert(source.includes("SignalForceBuffer[latestSignalIndex] = SwLatestSignalStrengthValue;"));
+  assert(robotSource.includes("const int SW_BUFFER_BUY = 0;"));
+  assert(robotSource.includes("const int SW_BUFFER_SELL = 1;"));
+  assert(robotSource.includes("const int SW_BUFFER_ENTRY = 2;"));
+  assert(robotSource.includes("const int SW_BUFFER_STOP = 3;"));
+  assert(robotSource.includes("const int SW_BUFFER_TP1 = 4;"));
+  assert(robotSource.includes("const int SW_BUFFER_TP2 = 5;"));
+  assert(robotSource.includes("const int SW_BUFFER_FORCE = 6;"));
+  assert(robotSource.includes('#property tester_indicator "Silent Wolf Trading\\\\silentwolfforex.ex5"'));
+  assert(robotSource.includes('#property tester_indicator "Silent Wolf Trading\\\\silentwolfindices.ex5"'));
+  assert(robotSource.includes('input string InpMonitoredTimeframes = "M5,M15,M30,H1,H4";'));
+  assert(robotSource.includes("iCustom(_Symbol, TimeframeStates[stateIndex].timeframe, SelectedIndicatorPath, true)"));
+  assert(robotSource.includes("bool HasActiveTradeForSymbol()"));
+  assert(robotSource.includes("CopyBuffer(handle, buffer, shift, 1, data)"));
+  assert(!robotSource.includes("_Period"));
   assert(!/SwStats|SwSweep|SwAction|TAUX DE REUSSITE|SWEEP DU JOUR|ACTIONS/.test(source));
-  console.log(path + ": signal and interpretation cases passed");
+  console.log(path + ": signal and strength cases passed");
 }
+
+const orderContext = {
+  EMPTY_VALUE: Infinity, _Point: 0.01, _Digits: 2, _Symbol: "TEST",
+  InpMinimumSignalForce: 55, InpMagicNumber: 1, InpDeviationPoints: 20,
+  SYMBOL_EXPIRATION_MODE: 1, SYMBOL_EXPIRATION_DAY: 1, ORDER_TIME_DAY: 1,
+  TERMINAL_CONNECTED: 1, TERMINAL_TRADE_ALLOWED: 1, MQL_TRADE_ALLOWED: 1,
+  ACCOUNT_TRADE_ALLOWED: 1, MathIsValidNumber: Number.isFinite,
+  IsAlignedToTick: value => Math.abs(value * 100 - Math.round(value * 100)) < 1e-6,
+  IsMarketSessionOpen: () => true, IsDirectionAllowed: () => true,
+  TerminalInfoInteger: () => true, MQLInfoInteger: () => true,
+  AccountInfoInteger: () => true, IsPaused: () => false,
+  HasActiveTradeForSymbol: () => false, SkipSignal: () => {},
+  SymbolInfoTick: (_, tick) => { tick.ask = 101; tick.bid = 99; return true; },
+  calculateVolume: requirePartial => { orderContext.requirePartial = requirePartial; return true; },
+  StoreSignalState: (...args) => { orderContext.stored = args; },
+  SignalComment: () => "signal", TradeResultAccepted: () => true,
+  DoubleToString: value => String(value), PrintFormat: () => {},
+  Trade: {
+    SetExpertMagicNumber: () => {}, SetDeviationInPoints: () => {},
+    SetTypeFillingBySymbol: () => {},
+    BuyLimit: (...args) => { orderContext.order = args; return true; },
+    SellLimit: (...args) => { orderContext.order = args; return true; },
+  },
+};
+vm.createContext(orderContext);
+vm.runInContext(translate(extract(robotSource, "ValidSignalPrices")), orderContext);
+let orderCode = extract(robotSource, "PlaceSignalOrder")
+  .replace(/bool PlaceSignalOrder\([\s\S]*?\)\n\{/,
+    "function PlaceSignalOrder(signalTime, timeframe, direction, entry, stop, tp1, tp2, force)\n{")
+  .replace("MqlTick tick;", "let tick = {};")
+  .replace("SymbolInfoInteger(_Symbol, SYMBOL_EXPIRATION_MODE, expirationMode)",
+    "((expirationMode = SYMBOL_EXPIRATION_DAY), true)")
+  .replace("CalculatePositionVolume(direction, entry, stop, hasSecondTarget, volume)",
+    "((volume = 1), calculateVolume(hasSecondTarget))")
+  .replace(/"\s*\n\s*"/g, '" + "')
+  .replace(/\b(?:bool|int|double|long|string)\s+/g, "let ");
+vm.runInContext(orderCode, orderContext);
+assert.equal(orderContext.ValidSignalPrices(1, 100, 98, 103.99, Infinity), false);
+assert.equal(orderContext.ValidSignalPrices(-1, 100, 102, 96, Infinity), true);
+assert.equal(orderContext.ValidSignalPrices(1, 100, 98, 104, 104), false);
+assert.equal(orderContext.PlaceSignalOrder(1, 5, 1, 100, 98, 104, Infinity, 80), true);
+assert.equal(orderContext.requirePartial, false);
+assert.equal(orderContext.stored[5], 104);
+assert.equal(orderContext.order[4], 104);
+assert.equal(orderContext.PlaceSignalOrder(1, 5, 1, 100, 98, 104, 106, 80), true);
+assert.equal(orderContext.requirePartial, true);
+assert.equal(orderContext.stored[5], 106);
+assert.equal(orderContext.order[4], 106);
+assert.equal(orderContext.PlaceSignalOrder(1, 5, 1, 100, 98, 103, 106, 80), false);
+assert.equal(orderContext.PlaceSignalOrder(1, 5, -1, 100, 102, 96, Infinity, 80), true);
+assert.equal(orderContext.order[4], 96);
+const manageCode = extract(robotSource, "ManageOpenPositions");
+const partialStart = manageCode.indexOf("if(tp2 != tp1 && tp1Reached && !GlobalVariableCheck(tp1DoneKey))");
+assert(partialStart >= 0);
+const partialOpen = manageCode.indexOf("{", partialStart);
+let partialDepth = 1, partialEnd = partialOpen + 1;
+for (; partialDepth && partialEnd < manageCode.length; partialEnd++) {
+  if (manageCode[partialEnd] === "{") partialDepth++;
+  if (manageCode[partialEnd] === "}") partialDepth--;
+}
+assert.equal(partialDepth, 0);
+const partialCode = manageCode.slice(partialStart, partialEnd)
+  .replace(/\bdouble\s+/g, "let ")
+  .replace(/\(double\)/g, "");
+const partialContext = {
+  tp1: 104, tp2: 104, tp1Reached: true, tp1DoneKey: "done",
+  currentVolume: 2, InpTp1ClosePercent: 50, _Symbol: "TEST",
+  SYMBOL_VOLUME_MIN: 1, ticket: 1, type: 0, TimeCurrent: () => 1,
+  NormalizeVolumeDown: volume => volume, SymbolInfoDouble: () => 0.1,
+  GlobalVariableCheck: () => false, GlobalVariableSet: () => {},
+  ClosePartial: () => { partialContext.closed++; return true; },
+  closed: 0,
+};
+vm.runInNewContext(partialCode, partialContext);
+assert.equal(partialContext.closed, 0);
+partialContext.tp2 = 106;
+vm.runInNewContext(partialCode, partialContext);
+assert.equal(partialContext.closed, 1);
+console.log("SWRobots: single and two target cases passed");
