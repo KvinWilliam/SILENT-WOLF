@@ -37,7 +37,8 @@ function translate(code) {
       "((exitDirection = exits[bar] || 0), exitDirection !== 0)");
 }
 
-function runSelection(source, candidates, statuses, previousShift = -1, exits = {}, hasZones = true) {
+function runSelection(source, candidates, statuses, previousShift = -1, exits = {}, hasZones = true,
+  oldestSignalIndex = 4, pivot = true) {
   const start = source.indexOf("   for(int i = searchOldestIndex; i >= 1; --i)");
   const end = source.indexOf('   if(fullRecalculation)\n      PrintFormat("SilentWolf : patterns=', start);
   assert(start >= 0 && end > start);
@@ -57,13 +58,13 @@ function runSelection(source, candidates, statuses, previousShift = -1, exits = 
     ChartZones: hasZones ? [{}] : [], ArraySize: values => values.length,
     time: Array.from({ length: 20 }, (_, i) => 100 - i),
     open: [], high: [], low: [], close: Array(20).fill(100),
-    InpSwingLookbackBars: 1, rates_total: 20, oldestSignalIndex: 4, previousShift,
+    InpSwingLookbackBars: 1, rates_total: 20, oldestSignalIndex, previousShift,
     previousTime: previousShift < 0 ? 0 : 100 - previousShift,
     previousDirection: 1, previousName: "ancien",
     previousEntry: 100, previousRisk: 1, previousStop: 90,
     ActiveSignalTime: 0, ActiveSignalDirection: 0,
     PositionStateInitialized: true, REJECT_NONE: 0, INDICATOR_READ_PENDING: 1,
-    IsConfirmedSwingPivot: () => true, EstimateLoss: () => 1,
+    IsConfirmedSwingPivot: () => pivot, EstimateLoss: () => 1,
     EffectiveMaxSignalAgeBars: () => 1,
     ReportDataIssue: () => {},
     SignalStatus: index => statuses[index],
@@ -242,6 +243,12 @@ for (const path of paths) {
   assert.equal(context.DisplayedSignalIndex(-1, -1, 20000), -1);
   const old = [1, 4, 1, "ancien", 90];
   const recent = [-1, 2, 1, "recent", 110];
+  assert.match(extract(source, "OnCalculate"), /int oldestSignalIndex = rates_total - 2;/);
+  const sameSwing = [1, 2, 1, "meme swing", 90];
+  assert.equal(runSelection(source, { 8: old, 1: sameSwing },
+    { 8: "ACTIF", 1: "ACTIF" }, -1, {}, true, 10, false).index, 8);
+  assert.equal(runSelection(source, { 8: old, 1: sameSwing },
+    { 8: "ACTIF", 1: "ACTIF" }, -1, {}, true, 4, false).index, 1);
   assert.deepEqual(runSelection(source, { 3: old, 1: recent },
     { 3: "ACTIF", 1: "STOP TOUCHÉ" }),
   { index: 1, time: 99, direction: -1, status: "STOP TOUCHÉ" });
@@ -269,9 +276,9 @@ for (const path of paths) {
   assert(!/VWAP|Vwap|vwap/.test(source));
   assert.equal((source.match(/BullishBuffer\[latestSignalIndex\] =/g) || []).length, 1);
   assert.equal((source.match(/BearishBuffer\[latestSignalIndex\] =/g) || []).length, 1);
-  assert(source.includes("#property indicator_buffers 7"));
-  assert(source.includes("#property indicator_plots   7"));
-  assert.equal((source.match(/SetIndexBuffer\([0-6],/g) || []).length, 7);
+  assert(source.includes("#property indicator_buffers 8"));
+  assert(source.includes("#property indicator_plots   8"));
+  assert.equal((source.match(/SetIndexBuffer\([0-7],/g) || []).length, 8);
   assert(source.includes("SignalEntryBuffer[latestSignalIndex] = LatestEntry1Price;"));
   assert(source.includes("SignalStopBuffer[latestSignalIndex] = LatestStopPrice;"));
   assert(source.includes("SignalTp1Buffer[latestSignalIndex] = LatestTakeProfit1;"));
@@ -287,7 +294,7 @@ for (const path of paths) {
   assert(robotSource.includes('#property tester_indicator "Silent Wolf Trading\\\\silentwolfforex.ex5"'));
   assert(robotSource.includes('#property tester_indicator "Silent Wolf Trading\\\\silentwolfindices.ex5"'));
   assert(robotSource.includes('input string InpMonitoredTimeframes = "M5,M15,M30,H1,H4";'));
-  assert(robotSource.includes("iCustom(_Symbol, TimeframeStates[stateIndex].timeframe, SelectedIndicatorPath, true)"));
+  assert(robotSource.includes("IndicatorCreate(_Symbol, TimeframeStates[stateIndex].timeframe, IND_CUSTOM,"));
   assert(robotSource.includes("bool HasActiveTradeForSymbol()"));
   assert(robotSource.includes("CopyBuffer(handle, buffer, shift, 1, data)"));
   assert(!robotSource.includes("_Period"));
@@ -308,7 +315,7 @@ const orderContext = {
   HasActiveTradeForSymbol: () => false, SkipSignal: () => {},
   SymbolInfoTick: (_, tick) => { tick.ask = 101; tick.bid = 99; return true; },
   calculateVolume: requirePartial => { orderContext.requirePartial = requirePartial; return true; },
-  StoreSignalState: (...args) => { orderContext.stored = args; },
+  StoreSignalState: (...args) => { orderContext.stored = args; return true; },
   SignalComment: () => "signal", TradeResultAccepted: () => true,
   DoubleToString: value => String(value), PrintFormat: () => {},
   Trade: {
@@ -320,8 +327,8 @@ const orderContext = {
 };
 vm.createContext(orderContext);
 vm.runInContext(translate(extract(robotSource, "ValidSignalPrices")), orderContext);
-let orderCode = extract(robotSource, "PlaceSignalOrder")
-  .replace(/bool PlaceSignalOrder\([\s\S]*?\)\n\{/,
+let orderCode = extract(robotSource, "PlaceSignalOrderLocked")
+  .replace(/bool PlaceSignalOrderLocked\([\s\S]*?\)\n\{/,
     "function PlaceSignalOrder(signalTime, timeframe, direction, entry, stop, tp1, tp2, force)\n{")
   .replace("MqlTick tick;", "let tick = {};")
   .replace("SymbolInfoInteger(_Symbol, SYMBOL_EXPIRATION_MODE, expirationMode)",
@@ -345,31 +352,6 @@ assert.equal(orderContext.order[4], 106);
 assert.equal(orderContext.PlaceSignalOrder(1, 5, 1, 100, 98, 103, 106, 80), false);
 assert.equal(orderContext.PlaceSignalOrder(1, 5, -1, 100, 102, 96, Infinity, 80), true);
 assert.equal(orderContext.order[4], 96);
-const manageCode = extract(robotSource, "ManageOpenPositions");
-const partialStart = manageCode.indexOf("if(tp2 != tp1 && tp1Reached && !GlobalVariableCheck(tp1DoneKey))");
-assert(partialStart >= 0);
-const partialOpen = manageCode.indexOf("{", partialStart);
-let partialDepth = 1, partialEnd = partialOpen + 1;
-for (; partialDepth && partialEnd < manageCode.length; partialEnd++) {
-  if (manageCode[partialEnd] === "{") partialDepth++;
-  if (manageCode[partialEnd] === "}") partialDepth--;
-}
-assert.equal(partialDepth, 0);
-const partialCode = manageCode.slice(partialStart, partialEnd)
-  .replace(/\bdouble\s+/g, "let ")
-  .replace(/\(double\)/g, "");
-const partialContext = {
-  tp1: 104, tp2: 104, tp1Reached: true, tp1DoneKey: "done",
-  currentVolume: 2, InpTp1ClosePercent: 50, _Symbol: "TEST",
-  SYMBOL_VOLUME_MIN: 1, ticket: 1, type: 0, TimeCurrent: () => 1,
-  NormalizeVolumeDown: volume => volume, SymbolInfoDouble: () => 0.1,
-  GlobalVariableCheck: () => false, GlobalVariableSet: () => {},
-  ClosePartial: () => { partialContext.closed++; return true; },
-  closed: 0,
-};
-vm.runInNewContext(partialCode, partialContext);
-assert.equal(partialContext.closed, 0);
-partialContext.tp2 = 106;
-vm.runInNewContext(partialCode, partialContext);
-assert.equal(partialContext.closed, 1);
+const manageCode = extract(robotSource, "ManageOpenPositionsLocked");
+assert.match(manageCode, /if\(tp2 != tp1 && tp1Reached && !HasPendingEntryForSymbol\(\)\)\s+ManagePartialTarget/);
 console.log("SWRobots: single and two target cases passed");

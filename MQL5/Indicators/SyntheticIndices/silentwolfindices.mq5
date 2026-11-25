@@ -1,8 +1,8 @@
 #property strict
 #property indicator_chart_window
 #property version   "1.00"
-#property indicator_buffers 7
-#property indicator_plots   7
+#property indicator_buffers 8
+#property indicator_plots   8
 
 #property indicator_label1  "Bullish pin bar fusion"
 #property indicator_type1   DRAW_ARROW
@@ -24,6 +24,8 @@
 #property indicator_type6   DRAW_NONE
 #property indicator_label7  "SW Force"
 #property indicator_type7   DRAW_NONE
+#property indicator_label8  "SW Ready"
+#property indicator_type8   DRAW_NONE
 
 enum ENUM_STOP_BUFFER_MODE
 {
@@ -74,6 +76,7 @@ enum ENUM_INDICATOR_READ
 };
 
 input bool   InpInternalBufferOnly  = false;     // Instance interne SWRobots, sans interface ni alertes
+input long   InpInternalSourceChartId = 0;       // Graphique source des zones pour SWRobots
 input double InpWickBodyRatio       = 2.0;       // Dominant wick / body: strictly greater than this ratio
 input int    InpArrowOffsetPoints    = 20;        // Arrow distance from candle, in points
 input int    InpSwingLookbackBars    = 5;         // Bars used to identify pin swings and Dow pivots
@@ -82,7 +85,7 @@ input int    InpPinSwingLookbackM5   = 36;        // M5 : nombre de bougies
 input int    InpPinSwingLookbackM15  = 12;        // M15 : nombre de bougies
 input int    InpPinSwingLookbackM30  = 6;         // M30 : nombre de bougies
 input int    InpPinSwingLookbackH1   = 6;         // H1 : nombre de bougies
-input int    InpMaxBarsToScan        = 20000;     // Barres rescannées après le calcul initial
+input int    InpMaxBarsToScan        = 20000;     // Réservé pour compatibilité des paramètres
 input string InpBullishZonePrefix    = "Zone_Haussière_"; // Préfixe des zones d'achat
 input string InpBearishZonePrefix    = "Zone_Baissière_"; // Préfixe des zones de vente
 input bool   InpExtendZonesRight     = true;      // Zone active après son bord droit
@@ -142,6 +145,7 @@ double SignalStopBuffer[];
 double SignalTp1Buffer[];
 double SignalTp2Buffer[];
 double SignalForceBuffer[];
+double SignalReadyBuffer[];
 int AtrHandle = INVALID_HANDLE;
 datetime LastBarTime = 0;
 bool SignalsDirty = true;
@@ -348,7 +352,10 @@ string SwRsiAt(const datetime at, double &rsi7, double &rsi14)
    bool fastReady = SwRead(SwRsi7[0], shift, rsi7);
    bool slowReady = SwRead(SwRsi14[0], shift, rsi14);
    if(!fastReady || !slowReady)
+   {
+      ReportDataIssue("RSI de confirmation");
       return "n/d";
+   }
    string state = "RANGE";
    if(rsi7 <= InpRsiOversold && rsi14 <= InpRsiOversold) state = "SURVENTE";
    else if(rsi7 >= InpRsiOverbought && rsi14 >= InpRsiOverbought) state = "SURACHAT";
@@ -430,7 +437,10 @@ string SwDivergenceAt(const datetime at, string &rsi7, string &rsi14)
    MqlRates bars[];
    ArraySetAsSeries(bars, true);
    if(CopyRates(_Symbol, _Period, shift, count, bars) != count)
+   {
+      ReportDataIssue("historique divergence RSI");
       return "7:n/d 14:n/d";
+   }
    rsi7 = SwDivergenceFor(SwRsi7[0], bars, shift);
    rsi14 = SwDivergenceFor(SwRsi14[0], bars, shift);
    return "7:" + rsi7 + " 14:" + rsi14;
@@ -516,7 +526,19 @@ void SwRefreshInfo()
 
 bool RefreshChartZones()
 {
-   int objectCount = ObjectsTotal(0, 0, OBJ_RECTANGLE);
+   long sourceChart = InpInternalBufferOnly ? InpInternalSourceChartId : 0;
+   if(InpInternalBufferOnly
+      && (sourceChart <= 0 || ChartSymbol(sourceChart) != _Symbol))
+   {
+      Print("SilentWolf : graphique source des zones indisponible ou symbole incorrect.");
+      return false;
+   }
+   int objectCount = ObjectsTotal(sourceChart, 0, OBJ_RECTANGLE);
+   if(objectCount < 0)
+   {
+      Print("SilentWolf : lecture des zones impossible : ", GetLastError());
+      return false;
+   }
    if(ArrayResize(ChartZones, objectCount) != objectCount)
    {
       Print("Impossible de mettre en cache les rectangles de zones. Erreur: ",
@@ -527,7 +549,12 @@ bool RefreshChartZones()
 
    for(int index = 0; index < objectCount; ++index)
    {
-      string objectName = ObjectName(0, index, 0, OBJ_RECTANGLE);
+      string objectName = ObjectName(sourceChart, index, 0, OBJ_RECTANGLE);
+      if(objectName == "")
+      {
+         Print("SilentWolf : lecture du nom d'une zone impossible : ", GetLastError());
+         return false;
+      }
       int direction = 0;
       if(StringFind(objectName, InpBullishZonePrefix) == 0)
          direction = 1;
@@ -536,12 +563,21 @@ bool RefreshChartZones()
       if(direction == 0)
          continue;
 
-      datetime time1 = (datetime)ObjectGetInteger(0, objectName, OBJPROP_TIME, 0);
-      datetime time2 = (datetime)ObjectGetInteger(0, objectName, OBJPROP_TIME, 1);
-      double price1 = ObjectGetDouble(0, objectName, OBJPROP_PRICE, 0);
-      double price2 = ObjectGetDouble(0, objectName, OBJPROP_PRICE, 1);
-      ChartZones[zoneCount].start = time1 < time2 ? time1 : time2;
-      ChartZones[zoneCount].end = time1 > time2 ? time1 : time2;
+      long time1, time2;
+      double price1, price2;
+      if(!ObjectGetInteger(sourceChart, objectName, OBJPROP_TIME, 0, time1)
+         || !ObjectGetInteger(sourceChart, objectName, OBJPROP_TIME, 1, time2)
+         || !ObjectGetDouble(sourceChart, objectName, OBJPROP_PRICE, 0, price1)
+         || !ObjectGetDouble(sourceChart, objectName, OBJPROP_PRICE, 1, price2)
+         || time1 <= 0 || time2 <= 0 || !MathIsValidNumber(price1)
+         || !MathIsValidNumber(price2) || price1 <= 0.0 || price2 <= 0.0)
+      {
+         Print("SilentWolf : lecture de la zone ", objectName, " impossible ou invalide : ",
+               GetLastError());
+         return false;
+      }
+      ChartZones[zoneCount].start = (datetime)(time1 < time2 ? time1 : time2);
+      ChartZones[zoneCount].end = (datetime)(time1 > time2 ? time1 : time2);
       ChartZones[zoneCount].low = MathMin(price1, price2);
       ChartZones[zoneCount].high = MathMax(price1, price2);
       ChartZones[zoneCount].direction = direction;
@@ -554,6 +590,28 @@ bool RefreshChartZones()
             GetLastError());
       return false;
    }
+   return true;
+}
+
+bool RefreshInternalZones(bool &changed)
+{
+   ChartZone previous[];
+   int count = ArraySize(ChartZones);
+   if(ArrayResize(previous, count) != count
+      || (count > 0 && ArrayCopy(previous, ChartZones) != count))
+   {
+      Print("Impossible de sauvegarder les zones avant leur actualisation. Erreur: ", GetLastError());
+      return false;
+   }
+   if(!RefreshChartZones())
+      return false;
+   changed = count != ArraySize(ChartZones);
+   for(int i = 0; !changed && i < count; ++i)
+      changed = previous[i].start != ChartZones[i].start
+                || previous[i].end != ChartZones[i].end
+                || previous[i].low != ChartZones[i].low
+                || previous[i].high != ChartZones[i].high
+                || previous[i].direction != ChartZones[i].direction;
    return true;
 }
 
@@ -763,16 +821,16 @@ bool FindPattern(const int i, const int rates_total,
 
    if(i + 1 < rates_total)
    {
-      if(allowInsideBar && IsInsideBar(i, high, low))
-      {
-         patternLength = 2;
-         patternName = "Inside bar";
-         return true;
-      }
       if(IsHaramiCross(i, open, high, low, close, direction))
       {
          patternLength = 2;
          patternName = direction > 0 ? "Harami Cross haussier" : "Harami Cross baissier";
+         return true;
+      }
+      if(allowInsideBar && IsInsideBar(i, high, low))
+      {
+         patternLength = 2;
+         patternName = "Inside bar";
          return true;
       }
       if(IsBullishEngulfing(i, open, close))
@@ -1163,22 +1221,6 @@ ENUM_INDICATOR_READ ReadIndicatorBuffer(const int handle, const int barIndex,
 
    value = buffer[0];
    return INDICATOR_READ_OK;
-}
-
-// C10 : forme booléenne (RSI du panneau et des messages). P4 : une valeur
-// structurellement absente ne déclenche plus de relance.
-bool ReadIndicatorValue(const int handle, const int barIndex,
-                        const int ratesTotal, double &value,
-                        const string context)
-{
-   return ReadIndicatorBuffer(handle, barIndex, ratesTotal, value, context,
-                              false) == INDICATOR_READ_OK;
-}
-
-bool ReadRsiValue(const int handle, const int barIndex, const int ratesTotal,
-                  double &value)
-{
-   return ReadIndicatorValue(handle, barIndex, ratesTotal, value, "RSI");
 }
 
 // C13 : stop calculé AVANT le tracé de la flèche (exigence C3).
@@ -1716,7 +1758,7 @@ string TableLabelCellText(const int field)
    if(field == 9) return "DIVERGENCE RSI";
    if(field == 10) return "TENDANCE EMA";
    if(field == 11) return "FORCE DU SIGNAL";
-   if(field == 12) return "ETAT";
+   if(field == 12) return "ETAT THEORIQUE";
    return "";
 }
 
@@ -2197,7 +2239,6 @@ int OnInit()
       return INIT_PARAMETERS_INCORRECT;
    }
    if(InpWickBodyRatio <= 0.0 || InpArrowOffsetPoints < 0
-      || InpMaxBarsToScan < 1
       || InpSwingLookbackBars < 1
       || InpPinSwingLookbackBars < 1 || InpPinSwingLookbackM5 < 1
       || InpPinSwingLookbackM15 < 1 || InpPinSwingLookbackM30 < 1
@@ -2271,6 +2312,7 @@ int OnInit()
    SetIndexBuffer(4, SignalTp1Buffer, INDICATOR_DATA);
    SetIndexBuffer(5, SignalTp2Buffer, INDICATOR_DATA);
    SetIndexBuffer(6, SignalForceBuffer, INDICATOR_DATA);
+   SetIndexBuffer(7, SignalReadyBuffer, INDICATOR_DATA);
    ArraySetAsSeries(BullishBuffer, true);
    ArraySetAsSeries(BearishBuffer, true);
    ArraySetAsSeries(SignalEntryBuffer, true);
@@ -2278,11 +2320,12 @@ int OnInit()
    ArraySetAsSeries(SignalTp1Buffer, true);
    ArraySetAsSeries(SignalTp2Buffer, true);
    ArraySetAsSeries(SignalForceBuffer, true);
+   ArraySetAsSeries(SignalReadyBuffer, true);
    PlotIndexSetInteger(0, PLOT_ARROW, 233);
    PlotIndexSetInteger(1, PLOT_ARROW, 234);
    PlotIndexSetDouble(0, PLOT_EMPTY_VALUE, EMPTY_VALUE);
    PlotIndexSetDouble(1, PLOT_EMPTY_VALUE, EMPTY_VALUE);
-   for(int plot = 2; plot < 7; ++plot)
+   for(int plot = 2; plot < 8; ++plot)
       PlotIndexSetDouble(plot, PLOT_EMPTY_VALUE, EMPTY_VALUE);
    IndicatorSetInteger(INDICATOR_DIGITS, _Digits);
    IndicatorSetString(INDICATOR_SHORTNAME, "silentwolfindices");
@@ -2363,6 +2406,7 @@ int OnCalculate(const int rates_total, const int prev_calculated,
          ArrayInitialize(SignalTp1Buffer, EMPTY_VALUE);
          ArrayInitialize(SignalTp2Buffer, EMPTY_VALUE);
          ArrayInitialize(SignalForceBuffer, EMPTY_VALUE);
+         ArrayInitialize(SignalReadyBuffer, EMPTY_VALUE);
       }
       for(int bar = 0; bar < 2; ++bar)
       {
@@ -2373,6 +2417,7 @@ int OnCalculate(const int rates_total, const int prev_calculated,
          SignalTp1Buffer[bar] = EMPTY_VALUE;
          SignalTp2Buffer[bar] = EMPTY_VALUE;
          SignalForceBuffer[bar] = EMPTY_VALUE;
+         SignalReadyBuffer[bar] = 1.0;
       }
       if(prev_calculated == 0 || LastBarTime != time[0])
       {
@@ -2399,6 +2444,18 @@ int OnCalculate(const int rates_total, const int prev_calculated,
       // P3 (b) : le compteur de relances est réarmé à chaque nouvelle barre.
       DataRetryCount = 0;
    }
+   if(InpInternalBufferOnly && newBar)
+   {
+      bool zonesChanged = false;
+      if(!RefreshInternalZones(zonesChanged))
+      {
+         SignalsDirty = true;
+         SignalReadyBuffer[1] = 0.0;
+         return 0;
+      }
+      if(zonesChanged)
+         SignalsDirty = true;
+   }
    bool fullRecalculation = prev_calculated == 0 || SignalsDirty;
    bool recalculateSignals = fullRecalculation || newBar || PendingNewBarAlert;
    if(!recalculateSignals && LatestSignalTime > 0)
@@ -2406,7 +2463,7 @@ int OnCalculate(const int rates_total, const int prev_calculated,
       int shift = iBarShift(_Symbol, _Period, LatestSignalTime, true);
       if(shift < 1)
          recalculateSignals = true;
-      else if(LatestSignalStatus != "SORTIE CONTRAIRE")
+      else if(!IndicatorDataPending && LatestSignalStatus != "SORTIE CONTRAIRE")
       {
          string status = SignalStatus(shift, LatestSignalDirection, LatestEntry1Price,
                                       LatestStopPrice, LatestTakeProfit1,
@@ -2439,8 +2496,7 @@ int OnCalculate(const int rates_total, const int prev_calculated,
    if(InpAlertOnZoneChange && fullRecalculation)
       EntryAlertArmedBarTime = time[1];
 
-   int oldestSignalIndex = fullRecalculation ? rates_total - 2
-                                            : MathMin(rates_total - 2, InpMaxBarsToScan);
+   int oldestSignalIndex = rates_total - 2;
    int previousShift = LatestSignalTime > 0
                        ? iBarShift(_Symbol, _Period, LatestSignalTime, true) : -1;
    datetime previousTime = LatestSignalTime;
@@ -2459,7 +2515,8 @@ int OnCalculate(const int rates_total, const int prev_calculated,
       if(!RefreshChartZones())
       {
          SignalsDirty = true;
-         return rates_total;
+         SignalReadyBuffer[1] = 0.0;
+         return 0;
       }
       ArrayInitialize(BullishBuffer, EMPTY_VALUE);
       ArrayInitialize(BearishBuffer, EMPTY_VALUE);
@@ -2468,6 +2525,7 @@ int OnCalculate(const int rates_total, const int prev_calculated,
       ArrayInitialize(SignalTp1Buffer, EMPTY_VALUE);
       ArrayInitialize(SignalTp2Buffer, EMPTY_VALUE);
       ArrayInitialize(SignalForceBuffer, EMPTY_VALUE);
+      ArrayInitialize(SignalReadyBuffer, EMPTY_VALUE);
    }
    else
    {
@@ -2688,20 +2746,21 @@ int OnCalculate(const int rates_total, const int prev_calculated,
                   RejectedByReason[REJECT_STOP], RejectedByReason[REJECT_GEOMETRY],
                   RejectedByReason[REJECT_DATA], RejectedByReason[REJECT_RANGE]);
 
-   if(ActiveSignalDirection != 0 && (!trackedSignalFound || !trackedSignalActive))
+   SwRefreshInfo();
+   if(!IndicatorDataPending && ActiveSignalDirection != 0
+      && (!trackedSignalFound || !trackedSignalActive))
    {
       ActiveSignalDirection = 0;
       ActiveSignalTime = 0;
    }
 
-   if(!PositionStateInitialized)
+   if(!IndicatorDataPending && !PositionStateInitialized)
    {
       ActiveSignalDirection = latestActiveDirection;
       ActiveSignalTime = latestActiveTime;
       PositionStateInitialized = true;
    }
 
-   SwRefreshInfo();
    if(!InpInternalBufferOnly) UpdateSignalTable();
 
    // C8 : PendingNewBarAlert est consommé ici, après un recalcul complet.
@@ -2726,7 +2785,7 @@ int OnCalculate(const int rates_total, const int prev_calculated,
                                                    direction, patternIndex,
                                                    patternLength, patternName,
                                                    alertStopPrice);
-      if(confirmedPattern && ActiveSignalDirection != 0
+      if(!IndicatorDataPending && confirmedPattern && ActiveSignalDirection != 0
          && direction != ActiveSignalDirection)
       {
          LastExitProcessedBarTime = time[confirmationIndex];
@@ -2744,7 +2803,7 @@ int OnCalculate(const int rates_total, const int prev_calculated,
    // exploitables, le marqueur d'armement est consommé, ET
    // LastEntryAlertBarTime est posé : aucun doublon possible, ni par
    // recalcul complet ultérieur ni par relance.
-   if(currentBarEntrySignal
+   if(!IndicatorDataPending && currentBarEntrySignal
       && EntryAlertArmedBarTime == time[confirmationIndex]
       && LastEntryAlertBarTime != time[confirmationIndex])
    {
@@ -2825,6 +2884,7 @@ int OnCalculate(const int rates_total, const int prev_calculated,
    else
       DataRetryCount = 0;
 
+   SignalReadyBuffer[1] = IndicatorDataPending ? 0.0 : 1.0;
    return rates_total;
 }
 
