@@ -12,6 +12,7 @@ for (const path of [
   const exitStart = source.indexOf("if(LastExitProcessedBarTime != time[confirmationIndex])");
   const entryStart = source.indexOf("// P3 (a) + C-R1", exitStart);
   assert(exitStart >= 0 && entryStart > exitStart);
+  assert.match(source.slice(entryStart), /if\(!IndicatorDataPending && currentBarEntrySignal/);
   let exitBlock = source.slice(exitStart, entryStart);
   assert(!exitBlock.includes("RaiseAlert("));
   assert.match(source.slice(entryStart), /StringFormat\("ENTRÉE[\s\S]*?RaiseAlert\(message\);/);
@@ -23,8 +24,12 @@ for (const path of [
   const exitContext = {
     LastExitProcessedBarTime: 0, time: [0, 100], confirmationIndex: 1,
     ActiveSignalDirection: 1, ActiveSignalTime: 50, exitDirection: -1,
-    confirmedPatternResult: true,
+    confirmedPatternResult: true, IndicatorDataPending: true,
   };
+  vm.runInNewContext(exitBlock, exitContext);
+  assert.equal(exitContext.ActiveSignalDirection, 1);
+  assert.equal(exitContext.LastExitProcessedBarTime, 0);
+  exitContext.IndicatorDataPending = false;
   vm.runInNewContext(exitBlock, exitContext);
   assert.equal(exitContext.ActiveSignalDirection, 0);
   assert.equal(exitContext.ActiveSignalTime, 0);

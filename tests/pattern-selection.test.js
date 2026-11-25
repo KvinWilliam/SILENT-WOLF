@@ -83,8 +83,10 @@ for (const path of [
     if (!FindPattern(1, 3, [], [], [], [], true, 0, 0, "")) throw new Error("inside bar not recognized");
   `, {
     IsInsideBar: () => true,
-    IsHaramiCross: () => { throw new Error("inside bar must take priority over harami"); },
+    IsHaramiCross: () => false,
   });
+  assert(patternCode.indexOf("IsHaramiCross(") < patternCode.indexOf("IsInsideBar("),
+    "Harami Cross must take priority over an overlapping inside bar");
 
   let pinCode = extract(source, "IsConfirmedPinBar")
     .replace(/bool IsConfirmedPinBar\([\s\S]*?\)\n\{/,
