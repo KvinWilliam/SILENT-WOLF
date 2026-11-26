@@ -14,13 +14,19 @@ enum ENUM_SW_SOURCE
 
 input ENUM_SW_SOURCE InpIndicatorSource = SW_SOURCE_AUTO;
 input string InpMonitoredTimeframes = "M5,M15,M30,H1,H4";
-input double InpRiskPercent = 10.0;
+input double InpRiskPercent = 1.0;
+input double InpMaxRiskPerOrderPercent = 1.0;
+input double InpMaxPortfolioRiskPercent = 3.0;
 input double InpMinimumSignalForce = 55.0;
 input double InpTp1ClosePercent = 50.0;
 input int InpDailyStopLossLimit = 3;
 input int InpWeeklyStopLossLimit = 5;
 input ulong InpMagicNumber = 20261124;
 input int InpDeviationPoints = 20;
+input bool InpShowActiveSignalMarker = true;
+input color InpActiveBuyMarkerColor = clrLimeGreen;
+input color InpActiveSellMarkerColor = clrTomato;
+input bool InpBlockExternalTradesForSymbol = true;
 
 const int SW_BUFFER_BUY = 0;
 const int SW_BUFFER_SELL = 1;
@@ -43,6 +49,15 @@ struct SwTimeframeState
    datetime pendingSignalBarTime;
    int pendingSignalReadAttempts;
    ulong nextSignalReadAttemptMs;
+   bool pendingSignalPrepared;
+   int pendingSignalDirection;
+   double pendingEntry;
+   double pendingStop;
+   double pendingTp1;
+   double pendingTp2;
+   double pendingForce;
+   datetime missedScanAfterTime;
+   bool missedScanEnabled;
 };
 
 class SwTrade : public CTrade
@@ -91,6 +106,11 @@ bool ConnectionWasAvailable = false;
 datetime LastIndicatorWarningTime = 0;
 datetime LastPauseWarningTime = 0;
 ulong NextPauseCheckMs = 0;
+bool MissedSignalAvailable = false;
+datetime MissedSignalTime = 0;
+ENUM_TIMEFRAMES MissedSignalTimeframe = PERIOD_CURRENT;
+int MissedSignalDirection = 0;
+double MissedSignalEntry = 0.0;
 
 enum ENUM_SW_JOURNAL_PHASE
 {
@@ -351,14 +371,45 @@ string TradeLockKey()
           + "." + CompactUnsigned((ulong)SymbolHash(_Symbol));
 }
 
+string PortfolioRiskLockKey()
+{
+   return "RP." + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN))
+          + "." + CompactUnsigned(InpMagicNumber);
+}
+
+bool EnsureTemporaryLock(const string key, const string description)
+{
+   if(GlobalVariableCheck(key))
+      return true;
+   ResetLastError();
+   if(GlobalVariableTemp(key))
+      return true;
+   int error = GetLastError();
+   if(error == ERR_GLOBALVARIABLE_EXISTS && GlobalVariableCheck(key))
+      return true;
+   Print("SWRobots : création du ", description, " impossible : ", error);
+   return false;
+}
+
+bool AcquirePortfolioRiskLock()
+{
+   string key = PortfolioRiskLockKey();
+   if(!EnsureTemporaryLock(key, "verrou de risque portefeuille"))
+      return false;
+   return GlobalVariableSetOnCondition(key, 1.0, 0.0);
+}
+
+void ReleasePortfolioRiskLock()
+{
+   if(!GlobalVariableSetOnCondition(PortfolioRiskLockKey(), 0.0, 1.0))
+      Print("SWRobots : libération du verrou de risque portefeuille impossible : ", GetLastError());
+}
+
 bool AcquireTradeLock()
 {
    string key = TradeLockKey();
-   if(!GlobalVariableTemp(key))
-   {
-      Print("SWRobots : création du verrou impossible : ", GetLastError());
+   if(!EnsureTemporaryLock(key, "verrou"))
       return false;
-   }
    return GlobalVariableSetOnCondition(key, 1.0, 0.0);
 }
 
@@ -388,6 +439,60 @@ bool ParseSignalComment(const string comment, datetime &signalTime,
    signalTime = (datetime)parsedTime;
    timeframe = (ENUM_TIMEFRAMES)parsedTimeframe;
    return true;
+}
+
+bool SignalAlreadySubmitted(const datetime signalTime, const ENUM_TIMEFRAMES timeframe)
+{
+   string comment = SignalComment(signalTime, timeframe);
+   string path = SignalJournalPath(signalTime, timeframe);
+   if(FileIsExist(path))
+   {
+      SwJournalRecord record;
+      if(ReadSignalJournal(path, record) && record.positionId > 0)
+         return true;
+   }
+   for(int i = OrdersTotal() - 1; i >= 0; --i)
+   {
+      ulong ticket = OrderGetTicket(i);
+      long magic;
+      string symbol, orderComment;
+      if(ticket > 0 && OrderGetInteger(ORDER_MAGIC, magic)
+         && OrderGetString(ORDER_SYMBOL, symbol)
+         && OrderGetString(ORDER_COMMENT, orderComment)
+         && (ulong)magic == InpMagicNumber && symbol == _Symbol
+         && orderComment == comment)
+         return true;
+   }
+   datetime now = TimeCurrent();
+   if(now < signalTime || !HistorySelect(signalTime, now))
+      return false;
+   for(int i = HistoryOrdersTotal() - 1; i >= 0; --i)
+   {
+      ulong order = HistoryOrderGetTicket(i);
+      long magic, state;
+      string symbol, orderComment;
+      if(order > 0 && HistoryOrderGetInteger(order, ORDER_MAGIC, magic)
+         && HistoryOrderGetInteger(order, ORDER_STATE, state)
+         && HistoryOrderGetString(order, ORDER_SYMBOL, symbol)
+         && HistoryOrderGetString(order, ORDER_COMMENT, orderComment)
+         && (ulong)magic == InpMagicNumber && symbol == _Symbol
+         && orderComment == comment && state != ORDER_STATE_REJECTED)
+         return true;
+   }
+   for(int i = HistoryDealsTotal() - 1; i >= 0; --i)
+   {
+      ulong deal = HistoryDealGetTicket(i);
+      long magic, entry;
+      string symbol, dealComment;
+      if(deal > 0 && HistoryDealGetInteger(deal, DEAL_MAGIC, magic)
+         && HistoryDealGetInteger(deal, DEAL_ENTRY, entry)
+         && HistoryDealGetString(deal, DEAL_SYMBOL, symbol)
+         && HistoryDealGetString(deal, DEAL_COMMENT, dealComment)
+         && (ulong)magic == InpMagicNumber && symbol == _Symbol
+         && dealComment == comment && entry == DEAL_ENTRY_IN)
+         return true;
+   }
+   return false;
 }
 
 bool ParseTimeframeName(string name, ENUM_TIMEFRAMES &timeframe)
@@ -528,10 +633,10 @@ bool RefreshIndicatorConfiguration()
       TYPE_DOUBLE, TYPE_DOUBLE, TYPE_BOOL, TYPE_BOOL, TYPE_STRING, TYPE_BOOL, TYPE_BOOL,
       TYPE_BOOL, TYPE_DOUBLE, TYPE_BOOL, TYPE_BOOL, TYPE_BOOL, TYPE_BOOL, TYPE_DOUBLE,
       TYPE_INT, TYPE_INT, TYPE_INT, TYPE_INT, TYPE_INT, TYPE_BOOL, TYPE_DOUBLE, TYPE_BOOL,
-      TYPE_DOUBLE, TYPE_BOOL, TYPE_BOOL
+      TYPE_DOUBLE, TYPE_BOOL, TYPE_BOOL, TYPE_STRING
    };
-   bool compatible = kind == IND_CUSTOM && parameterCount >= 47
-                     && ArraySize(parameters) >= 47 && parameters[0].type == TYPE_STRING;
+   bool compatible = kind == IND_CUSTOM && parameterCount >= 48
+                     && ArraySize(parameters) >= 48 && parameters[0].type == TYPE_STRING;
    for(int i = 0; compatible && i < ArraySize(types); ++i)
       compatible = parameters[i + 1].type == types[i];
    if(!compatible || parameters[1].integer_value != 0)
@@ -551,7 +656,7 @@ bool RefreshIndicatorConfiguration()
    parameters[0].string_value = path;
    parameters[1].integer_value = 1;
    parameters[2].integer_value = ChartID();
-   if(ArrayResize(parameters, 47) != 47)
+   if(ArrayResize(parameters, 48) != 48)
    {
       ReleaseIndicatorHandles();
       ArrayResize(IndicatorConfig, 0);
@@ -617,19 +722,117 @@ bool SaveLastProcessedSignalTime(const int stateIndex)
    return true;
 }
 
-bool MarkCurrentBarProcessed(const int stateIndex)
+string PendingSignalKey(const int stateIndex, const string field)
+{
+   return InstanceKey(TimeframeStates[stateIndex].timeframe) + ".P." + field;
+}
+
+bool SavePendingSignal(const int stateIndex)
+{
+   string readyKey = PendingSignalKey(stateIndex, "READY");
+   if(GlobalVariableSet(readyKey, 0.0) == 0)
+      return false;
+   bool saved = GlobalVariableSet(PendingSignalKey(stateIndex, "TIME"),
+                                  (double)TimeframeStates[stateIndex].pendingSignalBarTime) != 0
+                && GlobalVariableSet(PendingSignalKey(stateIndex, "DIR"),
+                                     (double)TimeframeStates[stateIndex].pendingSignalDirection) != 0
+                && GlobalVariableSet(PendingSignalKey(stateIndex, "ENTRY"),
+                                     TimeframeStates[stateIndex].pendingEntry) != 0
+                && GlobalVariableSet(PendingSignalKey(stateIndex, "STOP"),
+                                     TimeframeStates[stateIndex].pendingStop) != 0
+                && GlobalVariableSet(PendingSignalKey(stateIndex, "TP1"),
+                                     TimeframeStates[stateIndex].pendingTp1) != 0
+                && GlobalVariableSet(PendingSignalKey(stateIndex, "TP2"),
+                                     TimeframeStates[stateIndex].pendingTp2) != 0
+                && GlobalVariableSet(PendingSignalKey(stateIndex, "FORCE"),
+                                     TimeframeStates[stateIndex].pendingForce) != 0;
+   GlobalVariablesFlush();
+   if(!saved || GlobalVariableSet(readyKey, 1.0) == 0)
+      return false;
+   GlobalVariablesFlush();
+   return true;
+}
+
+bool RestorePendingSignal(const int stateIndex)
+{
+   string readyKey = PendingSignalKey(stateIndex, "READY");
+   if(!GlobalVariableCheck(readyKey) || GlobalVariableGet(readyKey) != 1.0)
+      return true;
+   double signalTime, direction, entry, stop, tp1, tp2, force;
+   if(!GlobalVariableGet(PendingSignalKey(stateIndex, "TIME"), signalTime)
+      || !GlobalVariableGet(PendingSignalKey(stateIndex, "DIR"), direction)
+      || !GlobalVariableGet(PendingSignalKey(stateIndex, "ENTRY"), entry)
+      || !GlobalVariableGet(PendingSignalKey(stateIndex, "STOP"), stop)
+      || !GlobalVariableGet(PendingSignalKey(stateIndex, "TP1"), tp1)
+      || !GlobalVariableGet(PendingSignalKey(stateIndex, "TP2"), tp2)
+      || !GlobalVariableGet(PendingSignalKey(stateIndex, "FORCE"), force)
+      || signalTime <= 0.0 || (direction != 1.0 && direction != -1.0)
+      || (double)(datetime)signalTime != signalTime
+      || !MathIsValidNumber(entry) || !MathIsValidNumber(stop)
+      || !MathIsValidNumber(tp1) || !MathIsValidNumber(tp2)
+      || !MathIsValidNumber(force) || entry == EMPTY_VALUE || stop == EMPTY_VALUE
+      || tp1 == EMPTY_VALUE || (tp2 != EMPTY_VALUE && tp2 <= 0.0))
+   {
+      Print("SWRobots : signal en attente corrompu ; traitement automatique bloqué sur ",
+            EnumToString(TimeframeStates[stateIndex].timeframe), ".");
+      return false;
+   }
+   datetime restoredTime = (datetime)signalTime;
+   if(restoredTime <= TimeframeStates[stateIndex].lastProcessedSignalTime)
+   {
+      if(GlobalVariableSet(readyKey, 0.0) == 0)
+         return false;
+      GlobalVariablesFlush();
+      return true;
+   }
+   TimeframeStates[stateIndex].pendingSignalBarTime = restoredTime;
+   TimeframeStates[stateIndex].pendingSignalDirection = (int)direction;
+   TimeframeStates[stateIndex].pendingEntry = entry;
+   TimeframeStates[stateIndex].pendingStop = stop;
+   TimeframeStates[stateIndex].pendingTp1 = tp1;
+   TimeframeStates[stateIndex].pendingTp2 = tp2;
+   TimeframeStates[stateIndex].pendingForce = force;
+   TimeframeStates[stateIndex].pendingSignalPrepared = true;
+   return true;
+}
+
+bool ClearPendingSignal(const int stateIndex)
+{
+   string readyKey = PendingSignalKey(stateIndex, "READY");
+   if(GlobalVariableCheck(readyKey) && GlobalVariableSet(readyKey, 0.0) == 0)
+      return false;
+   GlobalVariablesFlush();
+   TimeframeStates[stateIndex].pendingSignalPrepared = false;
+   TimeframeStates[stateIndex].pendingSignalDirection = 0;
+   TimeframeStates[stateIndex].pendingEntry = 0.0;
+   TimeframeStates[stateIndex].pendingStop = 0.0;
+   TimeframeStates[stateIndex].pendingTp1 = EMPTY_VALUE;
+   TimeframeStates[stateIndex].pendingTp2 = EMPTY_VALUE;
+   TimeframeStates[stateIndex].pendingForce = 0.0;
+   return true;
+}
+
+bool MarkSignalProcessed(const int stateIndex, const datetime closedBar)
 {
    bool saved = true;
-   datetime closedBar = iTime(_Symbol, TimeframeStates[stateIndex].timeframe, 1);
    if(closedBar > TimeframeStates[stateIndex].lastProcessedSignalTime)
    {
       TimeframeStates[stateIndex].lastProcessedSignalTime = closedBar;
       saved = SaveLastProcessedSignalTime(stateIndex);
    }
-   TimeframeStates[stateIndex].pendingSignalBarTime = 0;
+   if(saved && TimeframeStates[stateIndex].pendingSignalPrepared)
+      saved = ClearPendingSignal(stateIndex);
+   if(saved)
+      TimeframeStates[stateIndex].pendingSignalBarTime = 0;
    TimeframeStates[stateIndex].pendingSignalReadAttempts = 0;
    TimeframeStates[stateIndex].nextSignalReadAttemptMs = 0;
    return saved;
+}
+
+bool MarkCurrentBarProcessed(const int stateIndex)
+{
+   return MarkSignalProcessed(stateIndex,
+                              iTime(_Symbol, TimeframeStates[stateIndex].timeframe, 1));
 }
 
 bool ConnectedAndReady()
@@ -637,24 +840,12 @@ bool ConnectedAndReady()
    if(!TerminalInfoInteger(TERMINAL_CONNECTED))
    {
       ConnectionWasAvailable = false;
-      for(int i = 0; i < TimeframeCount; ++i)
-      {
-         TimeframeStates[i].pendingSignalBarTime = 0;
-         TimeframeStates[i].pendingSignalReadAttempts = 0;
-         MarkCurrentBarProcessed(i);
-      }
       return false;
    }
    if(!ConnectionWasAvailable)
    {
       ConnectionWasAvailable = true;
-      for(int i = 0; i < TimeframeCount; ++i)
-      {
-         TimeframeStates[i].lastObservedBarOpen =
-            iTime(_Symbol, TimeframeStates[i].timeframe, 0);
-         MarkCurrentBarProcessed(i);
-      }
-      Print("SWRobots reconnecté : les signaux clôturés pendant la déconnexion sont ignorés.");
+      Print("SWRobots reconnecté : reprise des signaux en attente et de la dernière bougie clôturée.");
       return false;
    }
    return true;
@@ -734,7 +925,8 @@ bool CalculatePositionVolume(const int direction, const double entry,
                              double &volume)
 {
    volume = 0.0;
-   double riskCash = AccountInfoDouble(ACCOUNT_EQUITY) * InpRiskPercent / 100.0;
+   double riskPercent = MathMin(InpRiskPercent, InpMaxRiskPerOrderPercent);
+   double riskCash = AccountInfoDouble(ACCOUNT_EQUITY) * riskPercent / 100.0;
    if(riskCash <= 0.0)
       return false;
 
@@ -768,6 +960,111 @@ bool CalculatePositionVolume(const int direction, const double entry,
    return true;
 }
 
+bool PortfolioRiskCash(double &riskCash)
+{
+   riskCash = 0.0;
+   for(int i = PositionsTotal() - 1; i >= 0; --i)
+   {
+      ulong ticket = PositionGetTicket(i);
+      long magic;
+      string symbol;
+      if(ticket == 0 || !PositionGetInteger(POSITION_MAGIC, magic)
+         || !PositionGetString(POSITION_SYMBOL, symbol))
+      {
+         Print("SWRobots : risque d'une position illisible ; nouvelles entrées bloquées.");
+         return false;
+      }
+      if((ulong)magic != InpMagicNumber)
+         continue;
+      double volume = PositionGetDouble(POSITION_VOLUME);
+      double entry = PositionGetDouble(POSITION_PRICE_OPEN);
+      double stop = PositionGetDouble(POSITION_SL);
+      if(volume <= 0.0 || entry <= 0.0 || stop <= 0.0)
+      {
+         Print("SWRobots : position du robot sans stop exploitable ; nouvelles entrées bloquées : ", ticket);
+         return false;
+      }
+      ENUM_ORDER_TYPE side = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE)
+                             == POSITION_TYPE_BUY ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+      double result = 0.0;
+      if(!OrderCalcProfit(side, symbol, volume, entry, stop, result)
+         || !MathIsValidNumber(result))
+      {
+         Print("SWRobots : calcul du risque d'une position impossible : ", ticket);
+         return false;
+      }
+      riskCash += MathMax(0.0, -result);
+   }
+
+   for(int i = OrdersTotal() - 1; i >= 0; --i)
+   {
+      ulong ticket = OrderGetTicket(i);
+      long magic;
+      string symbol;
+      if(ticket == 0 || !OrderGetInteger(ORDER_MAGIC, magic)
+         || !OrderGetString(ORDER_SYMBOL, symbol))
+      {
+         Print("SWRobots : risque d'un ordre en attente illisible ; nouvelles entrées bloquées.");
+         return false;
+      }
+      if((ulong)magic != InpMagicNumber)
+         continue;
+      ENUM_ORDER_TYPE pendingType = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+      ENUM_ORDER_TYPE side;
+      if(pendingType == ORDER_TYPE_BUY_LIMIT || pendingType == ORDER_TYPE_BUY_STOP
+         || pendingType == ORDER_TYPE_BUY_STOP_LIMIT)
+         side = ORDER_TYPE_BUY;
+      else if(pendingType == ORDER_TYPE_SELL_LIMIT || pendingType == ORDER_TYPE_SELL_STOP
+              || pendingType == ORDER_TYPE_SELL_STOP_LIMIT)
+         side = ORDER_TYPE_SELL;
+      else
+         continue;
+      double volume = OrderGetDouble(ORDER_VOLUME_CURRENT);
+      double entry = OrderGetDouble(ORDER_PRICE_OPEN);
+      double stop = OrderGetDouble(ORDER_SL);
+      if(volume <= 0.0 || entry <= 0.0 || stop <= 0.0)
+      {
+         Print("SWRobots : ordre du robot sans stop exploitable ; nouvelles entrées bloquées : ", ticket);
+         return false;
+      }
+      double result = 0.0;
+      if(!OrderCalcProfit(side, symbol, volume, entry, stop, result)
+         || !MathIsValidNumber(result))
+      {
+         Print("SWRobots : calcul du risque d'un ordre impossible : ", ticket);
+         return false;
+      }
+      riskCash += MathMax(0.0, -result);
+   }
+   return MathIsValidNumber(riskCash) && riskCash >= 0.0;
+}
+
+bool PortfolioRiskAllows(const int direction, const double entry, const double stop,
+                         const double volume)
+{
+   double existingRisk = 0.0;
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   if(equity <= 0.0 || !PortfolioRiskCash(existingRisk))
+      return false;
+   double newLoss = 0.0;
+   ENUM_ORDER_TYPE side = direction > 0 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+   if(!OrderCalcProfit(side, _Symbol, volume, entry, stop, newLoss)
+      || !MathIsValidNumber(newLoss))
+   {
+      Print("SWRobots : calcul du risque du nouvel ordre impossible.");
+      return false;
+   }
+   double cap = equity * InpMaxPortfolioRiskPercent / 100.0;
+   if(existingRisk + MathMax(0.0, -newLoss) > cap + 1.0e-8)
+   {
+      PrintFormat("SWRobots : ordre refusé par le plafond portefeuille : risque existant %.2f, nouvel ordre %.2f, plafond %.2f %s.",
+                  existingRisk, MathMax(0.0, -newLoss), cap,
+                  AccountInfoString(ACCOUNT_CURRENCY));
+      return false;
+   }
+   return true;
+}
+
 bool StoreSignalState(const datetime signalTime, const ENUM_TIMEFRAMES timeframe,
                       const double entry, const double stop,
                       const double tp1, const double tp2)
@@ -796,7 +1093,21 @@ bool StoreSignalState(const datetime signalTime, const ENUM_TIMEFRAMES timeframe
       record.server[i] = (ushort)StringGetCharacter(server, i);
    for(int i = 0; i < StringLen(_Symbol); ++i)
       record.symbol[i] = (ushort)StringGetCharacter(_Symbol, i);
-   if(!WriteSignalJournal(SignalJournalPath(signalTime, timeframe), record, true))
+   string path = SignalJournalPath(signalTime, timeframe);
+   if(FileIsExist(path))
+   {
+      SwJournalRecord existing;
+      if(!ReadSignalJournal(path, existing)
+         || existing.positionId != 0 || existing.phase != SW_JOURNAL_READY
+         || existing.signalTime != record.signalTime
+         || existing.timeframe != record.timeframe || existing.login != record.login
+         || existing.magic != record.magic || existing.entry != record.entry
+         || existing.stop != record.stop || existing.tp1 != record.tp1
+         || existing.tp2 != record.tp2 || StringLen(server) == 0)
+         return false;
+      return true;
+   }
+   if(!WriteSignalJournal(path, record, true))
       return false;
    return true;
 }
@@ -901,6 +1212,320 @@ bool RestorePositionState(const ulong positionId)
    return false;
 }
 
+string ActiveSignalArrowName()
+{
+   return "SW.ACTIVE." + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN))
+          + "." + CompactUnsigned(InpMagicNumber)
+          + "." + CompactUnsigned((ulong)SymbolHash(_Symbol)) + ".A";
+}
+
+string ActiveSignalTextName()
+{
+   return "SW.ACTIVE." + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN))
+          + "." + CompactUnsigned(InpMagicNumber)
+          + "." + CompactUnsigned((ulong)SymbolHash(_Symbol)) + ".T";
+}
+
+string MissedSignalStateKey(const string field)
+{
+   return InstanceKey(PERIOD_CURRENT) + ".MISSED." + field;
+}
+
+bool RestoreMissedSignalState()
+{
+   if(!GlobalVariableCheck(MissedSignalStateKey("READY"))
+      || GlobalVariableGet(MissedSignalStateKey("READY")) != 1.0)
+      return false;
+   double signalTime, timeframe, direction, entry;
+   if(!GlobalVariableGet(MissedSignalStateKey("TIME"), signalTime)
+      || !GlobalVariableGet(MissedSignalStateKey("TF"), timeframe)
+      || !GlobalVariableGet(MissedSignalStateKey("DIR"), direction)
+      || !GlobalVariableGet(MissedSignalStateKey("ENTRY"), entry)
+      || signalTime <= 0.0 || timeframe <= 0.0
+      || (direction != 1.0 && direction != -1.0)
+      || !MathIsValidNumber(entry) || entry <= 0.0)
+   {
+      GlobalVariableSet(MissedSignalStateKey("READY"), 0.0);
+      return false;
+   }
+   MissedSignalTime = (datetime)signalTime;
+   MissedSignalTimeframe = (ENUM_TIMEFRAMES)(int)timeframe;
+   MissedSignalDirection = (int)direction;
+   MissedSignalEntry = entry;
+   MissedSignalAvailable = true;
+   return true;
+}
+
+bool SaveMissedSignalState(const datetime signalTime,
+                           const ENUM_TIMEFRAMES timeframe,
+                           const int direction, const double entry)
+{
+   if(signalTime <= 0 || timeframe <= 0 || (direction != 1 && direction != -1)
+      || !MathIsValidNumber(entry) || entry <= 0.0 || entry == EMPTY_VALUE)
+      return false;
+   if(signalTime <= MissedSignalTime && MissedSignalAvailable)
+      return true;
+   string readyKey = MissedSignalStateKey("READY");
+   if(GlobalVariableSet(readyKey, 0.0) == 0)
+      return false;
+   bool saved = GlobalVariableSet(MissedSignalStateKey("TIME"), (double)signalTime) != 0
+                && GlobalVariableSet(MissedSignalStateKey("TF"), (double)timeframe) != 0
+                && GlobalVariableSet(MissedSignalStateKey("DIR"), (double)direction) != 0
+                && GlobalVariableSet(MissedSignalStateKey("ENTRY"), entry) != 0;
+   GlobalVariablesFlush();
+   if(!saved || GlobalVariableSet(readyKey, 1.0) == 0)
+      return false;
+   GlobalVariablesFlush();
+   MissedSignalTime = signalTime;
+   MissedSignalTimeframe = timeframe;
+   MissedSignalDirection = direction;
+   MissedSignalEntry = entry;
+   MissedSignalAvailable = true;
+   return true;
+}
+
+void ClearMissedSignalState()
+{
+   MissedSignalAvailable = false;
+   if(GlobalVariableCheck(MissedSignalStateKey("READY")))
+   {
+      GlobalVariableSet(MissedSignalStateKey("READY"), 0.0);
+      GlobalVariablesFlush();
+   }
+}
+
+bool ReadActiveSignalJournal(const datetime signalTime,
+                             const ENUM_TIMEFRAMES timeframe,
+                             const ulong positionId,
+                             SwJournalRecord &record)
+{
+   if(signalTime <= 0 || timeframe <= 0
+      || !ReadSignalJournal(SignalJournalPath(signalTime, timeframe), record))
+      return false;
+   if(record.signalTime != (long)signalTime || record.timeframe != (int)timeframe
+      || record.login != AccountInfoInteger(ACCOUNT_LOGIN)
+      || record.magic != InpMagicNumber
+      || (positionId > 0 && record.positionId != positionId))
+      return false;
+   return true;
+}
+
+bool ResolvePositionSignal(const ulong positionId, const string comment,
+                           datetime &signalTime, ENUM_TIMEFRAMES &timeframe,
+                           SwJournalRecord &record)
+{
+   if(ParseSignalComment(comment, signalTime, timeframe)
+      && ReadActiveSignalJournal(signalTime, timeframe, positionId, record))
+      return true;
+
+   double storedTime = 0.0, storedTimeframe = 0.0;
+   bool identified = GlobalVariableGet(PositionStateKey(positionId, "TIME"), storedTime)
+                     && GlobalVariableGet(PositionStateKey(positionId, "TF"), storedTimeframe)
+                     && storedTime > 0.0 && storedTimeframe > 0.0;
+   if(identified)
+   {
+      signalTime = (datetime)storedTime;
+      timeframe = (ENUM_TIMEFRAMES)(int)storedTimeframe;
+   }
+   if(!identified)
+      return false;
+   return ReadActiveSignalJournal(signalTime, timeframe, positionId, record);
+}
+
+bool UpdateActiveSignalMarker(const datetime signalTime,
+                             const ENUM_TIMEFRAMES timeframe,
+                             const int direction, const double entry,
+                             const bool isPosition, const bool isMissed = false)
+{
+   string arrowName = ActiveSignalArrowName();
+   string textName = ActiveSignalTextName();
+   color markerColor = direction > 0 ? InpActiveBuyMarkerColor : InpActiveSellMarkerColor;
+   datetime textTime = signalTime;
+   double textPrice = entry + (direction > 0 ? 12.0 : -12.0) * _Point;
+   string side = direction > 0 ? "ACHAT" : "VENTE";
+   string state = isMissed ? "MANQUÉ — NON EXÉCUTÉ"
+                  : (isPosition ? "POSITION ACTIVE" : "ORDRE EN ATTENTE");
+   string markerText = "SW " + side + " | " + state + " | " + EnumToString(timeframe);
+
+   if(ObjectFind(0, arrowName) < 0)
+   {
+      if(!ObjectCreate(0, arrowName, OBJ_ARROW, 0, signalTime, entry))
+      {
+         Print("SWRobots : création du repère de signal actif impossible : ", GetLastError());
+         return false;
+      }
+   }
+   else if(!ObjectMove(0, arrowName, 0, signalTime, entry))
+      return false;
+
+   ObjectSetInteger(0, arrowName, OBJPROP_ARROWCODE, direction > 0 ? 233 : 234);
+   ObjectSetInteger(0, arrowName, OBJPROP_COLOR, markerColor);
+   ObjectSetInteger(0, arrowName, OBJPROP_WIDTH, 2);
+   ObjectSetInteger(0, arrowName, OBJPROP_BACK, false);
+   ObjectSetInteger(0, arrowName, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, arrowName, OBJPROP_HIDDEN, true);
+   ObjectSetString(0, arrowName, OBJPROP_TOOLTIP, markerText);
+
+   if(ObjectFind(0, textName) < 0)
+   {
+      if(!ObjectCreate(0, textName, OBJ_TEXT, 0, textTime, textPrice))
+      {
+         Print("SWRobots : création du libellé de signal actif impossible : ", GetLastError());
+         return false;
+      }
+   }
+   else if(!ObjectMove(0, textName, 0, textTime, textPrice))
+      return false;
+   ObjectSetString(0, textName, OBJPROP_TEXT, markerText);
+   ObjectSetString(0, textName, OBJPROP_FONT, "Arial");
+   ObjectSetInteger(0, textName, OBJPROP_FONTSIZE, 8);
+   ObjectSetInteger(0, textName, OBJPROP_COLOR, markerColor);
+   ObjectSetInteger(0, textName, OBJPROP_ANCHOR, ANCHOR_LEFT);
+   ObjectSetInteger(0, textName, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, textName, OBJPROP_HIDDEN, true);
+   ChartRedraw(0);
+   return true;
+}
+
+void RemoveActiveSignalMarker()
+{
+   bool removed = ObjectDelete(0, ActiveSignalArrowName());
+   removed = ObjectDelete(0, ActiveSignalTextName()) || removed;
+   if(removed)
+      ChartRedraw(0);
+}
+
+void SyncActiveSignalMarker(const bool force = false)
+{
+   static ulong nextSyncMs = 0;
+   static ulong restorePositionId = 0;
+   static ulong lastRestoreMs = 0;
+   ulong nowMs = GetTickCount64();
+   if(!force && nowMs < nextSyncMs)
+      return;
+   nextSyncMs = nowMs + 1000;
+   if(!TerminalInfoInteger(TERMINAL_CONNECTED))
+      return;
+
+   if(!InpShowActiveSignalMarker)
+   {
+      RemoveActiveSignalMarker();
+      return;
+   }
+
+   bool found = false;
+   datetime bestTime = 0;
+   ENUM_TIMEFRAMES bestTimeframe = PERIOD_CURRENT;
+   int bestDirection = 0;
+   double bestEntry = 0.0;
+   bool bestIsPosition = false;
+
+   for(int i = PositionsTotal() - 1; i >= 0; --i)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0)
+         return;
+      string symbol, comment;
+      long magic;
+      if(!PositionGetString(POSITION_SYMBOL, symbol)
+         || !PositionGetInteger(POSITION_MAGIC, magic)
+         || !PositionGetString(POSITION_COMMENT, comment))
+         return;
+      if(symbol != _Symbol || (ulong)magic != InpMagicNumber)
+         continue;
+
+      ulong positionId = (ulong)PositionGetInteger(POSITION_IDENTIFIER);
+      if(positionId == 0)
+         continue;
+      datetime signalTime = 0;
+      ENUM_TIMEFRAMES timeframe = PERIOD_CURRENT;
+      SwJournalRecord record;
+      if(!ResolvePositionSignal(positionId, comment, signalTime, timeframe, record))
+      {
+         if(positionId != restorePositionId || nowMs - lastRestoreMs >= 5000)
+         {
+            restorePositionId = positionId;
+            lastRestoreMs = nowMs;
+            RestorePositionState(positionId);
+         }
+         if(!ResolvePositionSignal(positionId, comment, signalTime, timeframe, record))
+            continue;
+      }
+      int direction = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY
+                      ? 1 : -1;
+      if(!found || signalTime > bestTime
+         || (signalTime == bestTime && !bestIsPosition))
+      {
+         found = true;
+         bestTime = signalTime;
+         bestTimeframe = timeframe;
+         bestDirection = direction;
+         bestEntry = record.entry;
+         bestIsPosition = true;
+      }
+   }
+
+   for(int i = OrdersTotal() - 1; i >= 0; --i)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket == 0)
+         return;
+      string symbol, comment;
+      long magic, rawType;
+      if(!OrderGetString(ORDER_SYMBOL, symbol)
+         || !OrderGetInteger(ORDER_MAGIC, magic)
+         || !OrderGetString(ORDER_COMMENT, comment)
+         || !OrderGetInteger(ORDER_TYPE, rawType))
+         return;
+      if(symbol != _Symbol || (ulong)magic != InpMagicNumber)
+         continue;
+
+      ENUM_ORDER_TYPE orderType = (ENUM_ORDER_TYPE)rawType;
+      int direction;
+      if(orderType == ORDER_TYPE_BUY_LIMIT || orderType == ORDER_TYPE_BUY_STOP
+         || orderType == ORDER_TYPE_BUY_STOP_LIMIT)
+         direction = 1;
+      else if(orderType == ORDER_TYPE_SELL_LIMIT || orderType == ORDER_TYPE_SELL_STOP
+              || orderType == ORDER_TYPE_SELL_STOP_LIMIT)
+         direction = -1;
+      else
+         continue;
+      datetime signalTime;
+      ENUM_TIMEFRAMES timeframe;
+      if(!ParseSignalComment(comment, signalTime, timeframe))
+         continue;
+      SwJournalRecord record;
+      if(!ReadActiveSignalJournal(signalTime, timeframe, 0, record))
+         continue;
+      if(!found || signalTime > bestTime)
+      {
+         found = true;
+         bestTime = signalTime;
+         bestTimeframe = timeframe;
+         bestDirection = direction;
+         bestEntry = record.entry;
+         bestIsPosition = false;
+      }
+   }
+
+   if(!found)
+   {
+      if(MissedSignalAvailable)
+         UpdateActiveSignalMarker(MissedSignalTime, MissedSignalTimeframe,
+                                  MissedSignalDirection, MissedSignalEntry,
+                                  false, true);
+      else
+         RemoveActiveSignalMarker();
+      return;
+   }
+   if(MissedSignalAvailable)
+      ClearMissedSignalState();
+   for(int i = 0; i < TimeframeCount; ++i)
+      TimeframeStates[i].missedScanEnabled = false;
+   UpdateActiveSignalMarker(bestTime, bestTimeframe, bestDirection,
+                            bestEntry, bestIsPosition);
+}
+
 bool HasActiveTradeForSymbol()
 {
    bool hedging = AccountInfoInteger(ACCOUNT_MARGIN_MODE) == ACCOUNT_MARGIN_MODE_RETAIL_HEDGING;
@@ -917,9 +1542,8 @@ bool HasActiveTradeForSymbol()
       }
       if(symbol != _Symbol)
          continue;
-      if(!hedging)
-         return true;
-      if((ulong)magic == InpMagicNumber)
+      if(!hedging || InpBlockExternalTradesForSymbol
+         || (ulong)magic == InpMagicNumber)
          return true;
    }
    for(int i = OrdersTotal() - 1; i >= 0; --i)
@@ -933,9 +1557,10 @@ bool HasActiveTradeForSymbol()
          Print("SWRobots : lecture d'un ordre impossible ; entrée bloquée : ", GetLastError());
          return true;
       }
-      if(symbol != _Symbol || (hedging && (ulong)magic != InpMagicNumber))
+      if(symbol != _Symbol)
          continue;
-      return true;
+      if(!hedging || InpBlockExternalTradesForSymbol || (ulong)magic == InpMagicNumber)
+         return true;
    }
    return false;
 }
@@ -1075,17 +1700,125 @@ bool IsPaused()
    return true;
 }
 
-bool ReadSignalBuffer(const int handle, const int buffer, const int shift,
-                      double &value)
+bool ReadSignalBufferDetailed(const int handle, const int buffer, const int shift,
+                              double &value, int &calculated, int &errorCode)
 {
    value = EMPTY_VALUE;
-   if(handle == INVALID_HANDLE || BarsCalculated(handle) <= shift)
+   calculated = -1;
+   errorCode = 0;
+   if(handle == INVALID_HANDLE)
+   {
+      errorCode = -1;
+      return false;
+   }
+   ResetLastError();
+   calculated = BarsCalculated(handle);
+   errorCode = GetLastError();
+   if(calculated <= shift)
       return false;
    double data[1];
-   if(CopyBuffer(handle, buffer, shift, 1, data) != 1)
+   ResetLastError();
+   int copied = CopyBuffer(handle, buffer, shift, 1, data);
+   errorCode = GetLastError();
+   if(copied != 1 || !MathIsValidNumber(data[0]))
       return false;
    value = data[0];
    return true;
+}
+
+bool ReadSignalBuffer(const int handle, const int buffer, const int shift,
+                      double &value)
+{
+   int calculated = -1;
+   int errorCode = 0;
+   return ReadSignalBufferDetailed(handle, buffer, shift, value,
+                                   calculated, errorCode);
+}
+
+void CaptureMissedSignalHistory(const bool force = false)
+{
+   static ulong nextAttemptMs = 0;
+   ulong nowMs = GetTickCount64();
+   if(!force && nowMs < nextAttemptMs)
+      return;
+   nextAttemptMs = nowMs + 5000;
+   if(!TerminalInfoInteger(TERMINAL_CONNECTED))
+      return;
+
+   const int maximumBarsToScan = 100000;
+   for(int stateIndex = 0; stateIndex < TimeframeCount; ++stateIndex)
+   {
+      if(!TimeframeStates[stateIndex].missedScanEnabled)
+         continue;
+      ENUM_TIMEFRAMES timeframe = TimeframeStates[stateIndex].timeframe;
+      datetime cutoff = TimeframeStates[stateIndex].missedScanAfterTime;
+      if(cutoff <= 0)
+      {
+         TimeframeStates[stateIndex].missedScanEnabled = false;
+         continue;
+      }
+      if(!EnsureIndicatorHandle(stateIndex))
+         continue;
+      int cutoffShift = iBarShift(_Symbol, timeframe, cutoff, true);
+      if(cutoffShift < 0)
+         cutoffShift = iBarShift(_Symbol, timeframe, cutoff, false);
+      if(cutoffShift <= 2)
+      {
+         TimeframeStates[stateIndex].missedScanEnabled = false;
+         continue;
+      }
+
+      int count = (int)MathMin((double)(cutoffShift - 2),
+                               (double)maximumBarsToScan);
+      int handle = TimeframeStates[stateIndex].indicatorHandle;
+      if(count <= 0 || BarsCalculated(handle) < count + 2)
+         continue;
+      double currentReady;
+      if(!ReadSignalBuffer(handle, SW_BUFFER_READY, 1, currentReady)
+         || currentReady != 1.0)
+         continue;
+      double buy[], sell[];
+      if(ArrayResize(buy, count) != count || ArrayResize(sell, count) != count)
+         continue;
+      if(CopyBuffer(handle, SW_BUFFER_BUY, 2, count, buy) != count
+         || CopyBuffer(handle, SW_BUFFER_SELL, 2, count, sell) != count)
+         continue;
+
+      // CopyBuffer places the oldest requested bar first in memory. Walking
+      // backwards starts with shift 2, the newest closed bar before shift 1.
+      bool retryRead = false;
+      for(int index = count - 1; index >= 0; --index)
+      {
+         int shift = 2 + count - 1 - index;
+         datetime signalTime = iTime(_Symbol, timeframe, shift);
+         if(signalTime <= cutoff)
+            continue;
+         bool buySignal = buy[index] != EMPTY_VALUE && MathIsValidNumber(buy[index]);
+         bool sellSignal = sell[index] != EMPTY_VALUE && MathIsValidNumber(sell[index]);
+         if(buySignal == sellSignal)
+            continue;
+         int direction = buySignal ? 1 : -1;
+         double entryPrice;
+         if(!ReadSignalBuffer(handle, SW_BUFFER_ENTRY, shift, entryPrice))
+         {
+            retryRead = true;
+            break;
+         }
+         if(!MathIsValidNumber(entryPrice) || entryPrice <= 0.0
+            || entryPrice == EMPTY_VALUE)
+            continue;
+         if(SignalAlreadySubmitted(signalTime, timeframe))
+            continue;
+         if(!SaveMissedSignalState(signalTime, timeframe, direction, entryPrice))
+         {
+            retryRead = true;
+            break;
+         }
+         break;
+      }
+      if(!retryRead)
+         TimeframeStates[stateIndex].missedScanEnabled = false;
+   }
 }
 
 bool TradeResultAccepted()
@@ -1093,6 +1826,41 @@ bool TradeResultAccepted()
    uint code = Trade.ResultRetcode();
    return code == TRADE_RETCODE_PLACED || code == TRADE_RETCODE_DONE
           || code == TRADE_RETCODE_DONE_PARTIAL;
+}
+
+bool TradeResultRetryable()
+{
+   uint code = Trade.ResultRetcode();
+   return code == TRADE_RETCODE_REQUOTE || code == TRADE_RETCODE_PRICE_OFF
+          || code == TRADE_RETCODE_PRICE_CHANGED
+          || code == TRADE_RETCODE_TOO_MANY_REQUESTS
+          || code == TRADE_RETCODE_MARKET_CLOSED;
+}
+
+int PendingRetryDelayMilliseconds(const int attempts)
+{
+   if(attempts <= 1)
+      return 1000;
+   if(attempts == 2)
+      return 2000;
+   if(attempts <= 4)
+      return 5000;
+   return 30000;
+}
+
+void SchedulePendingSignalRetry(const int stateIndex, const string detail)
+{
+   ++TimeframeStates[stateIndex].pendingSignalReadAttempts;
+   TimeframeStates[stateIndex].nextSignalReadAttemptMs = GetTickCount64()
+         + PendingRetryDelayMilliseconds(TimeframeStates[stateIndex].pendingSignalReadAttempts);
+   if(TimeframeStates[stateIndex].pendingSignalReadAttempts == 5)
+   {
+      ENUM_TIMEFRAMES timeframe = TimeframeStates[stateIndex].timeframe;
+      datetime signalTime = TimeframeStates[stateIndex].pendingSignalBarTime;
+      PrintFormat("SWRobots : %s sur %s %s à %s ; nouvelle tentative conservée jusqu'à expiration.",
+                  detail, _Symbol, EnumToString(timeframe),
+                  TimeToString(signalTime, TIME_DATE | TIME_MINUTES));
+   }
 }
 
 void CancelPendingOrdersWhenPaused()
@@ -1154,16 +1922,28 @@ bool ValidSignalPrices(const int direction, const double entry, const double sto
 bool PlaceSignalOrderLocked(const datetime signalTime, const ENUM_TIMEFRAMES timeframe,
                       const int direction,
                       const double entry, const double stop,
-                      const double tp1, const double tp2, const double force)
+                      const double tp1, const double tp2, const double force,
+                      bool &retryable)
 {
+   retryable = false;
+   if(SignalAlreadySubmitted(signalTime, timeframe))
+   {
+      Print("SWRobots : signal déjà présent chez le broker ; aucune seconde entrée.");
+      return true;
+   }
    if(force < InpMinimumSignalForce)
    {
       SkipSignal(signalTime, timeframe, "force inférieure au minimum");
       return false;
    }
-   if(!IsMarketSessionOpen() || !IsDirectionAllowed(direction))
+   if(!IsDirectionAllowed(direction))
    {
-      SkipSignal(signalTime, timeframe, "marché fermé ou sens non autorisé");
+      SkipSignal(signalTime, timeframe, "sens non autorisé");
+      return false;
+   }
+   if(!IsMarketSessionOpen())
+   {
+      retryable = true;
       return false;
    }
    if(!TerminalInfoInteger(TERMINAL_CONNECTED)
@@ -1171,7 +1951,7 @@ bool PlaceSignalOrderLocked(const datetime signalTime, const ENUM_TIMEFRAMES tim
       || !MQLInfoInteger(MQL_TRADE_ALLOWED)
       || !AccountInfoInteger(ACCOUNT_TRADE_ALLOWED))
    {
-      SkipSignal(signalTime, timeframe, "connexion ou trading indisponible");
+      retryable = true;
       return false;
    }
    if(IsPaused())
@@ -1204,7 +1984,7 @@ bool PlaceSignalOrderLocked(const datetime signalTime, const ENUM_TIMEFRAMES tim
    MqlTick tick;
    if(!SymbolInfoTick(_Symbol, tick))
    {
-      SkipSignal(signalTime, timeframe, "cotations indisponibles");
+      retryable = true;
       return false;
    }
    if((direction > 0 && entry >= tick.ask)
@@ -1220,11 +2000,17 @@ bool PlaceSignalOrderLocked(const datetime signalTime, const ENUM_TIMEFRAMES tim
       SkipSignal(signalTime, timeframe, "money management ou volume minimal invalide");
       return false;
    }
+   if(!PortfolioRiskAllows(direction, entry, stop, volume))
+   {
+      SkipSignal(signalTime, timeframe, "plafond de risque portefeuille atteint ou risque existant inconnu");
+      return false;
+   }
 
    double finalTarget = hasSecondTarget ? tp2 : tp1;
    if(!StoreSignalState(signalTime, timeframe, entry, stop, tp1, finalTarget))
    {
       SkipSignal(signalTime, timeframe, "enregistrement du signal impossible");
+      retryable = true;
       return false;
    }
    Trade.SetExpertMagicNumber(InpMagicNumber);
@@ -1238,9 +2024,10 @@ bool PlaceSignalOrderLocked(const datetime signalTime, const ENUM_TIMEFRAMES tim
                                       ORDER_TIME_DAY, 0, comment);
    if(!submitted || !TradeResultAccepted())
    {
-      PrintFormat("SWRobots : ordre non confirmé (%u - %s). Vérifiez le broker ; "
-                  "le signal ne sera pas rejoué.",
-                  Trade.ResultRetcode(), Trade.ResultRetcodeDescription());
+      retryable = TradeResultRetryable();
+      PrintFormat("SWRobots : ordre refusé (%u - %s). %s",
+                  Trade.ResultRetcode(), Trade.ResultRetcodeDescription(),
+                  retryable ? "Nouvel essai planifié." : "Signal clos sans rejeu.");
       return false;
    }
 
@@ -1254,15 +2041,24 @@ bool PlaceSignalOrderLocked(const datetime signalTime, const ENUM_TIMEFRAMES tim
 
 bool PlaceSignalOrder(const datetime signalTime, const ENUM_TIMEFRAMES timeframe,
                       const int direction, const double entry, const double stop,
-                      const double tp1, const double tp2, const double force)
+                      const double tp1, const double tp2, const double force,
+                      bool &retryable)
 {
+   retryable = false;
    if(!AcquireTradeLock())
    {
-      SkipSignal(signalTime, timeframe, "verrou de trading indisponible");
+      retryable = true;
+      return false;
+   }
+   if(!AcquirePortfolioRiskLock())
+   {
+      ReleaseTradeLock();
+      retryable = true;
       return false;
    }
    bool placed = PlaceSignalOrderLocked(signalTime, timeframe, direction,
-                                        entry, stop, tp1, tp2, force);
+                                        entry, stop, tp1, tp2, force, retryable);
+   ReleasePortfolioRiskLock();
    ReleaseTradeLock();
    return placed;
 }
@@ -1273,62 +2069,158 @@ void ProcessPendingSignal(const int stateIndex)
    datetime pendingBarTime = TimeframeStates[stateIndex].pendingSignalBarTime;
    if(pendingBarTime <= 0)
       return;
-   if(iTime(_Symbol, timeframe, 1) != pendingBarTime)
+   int periodSeconds = PeriodSeconds(timeframe);
+   datetime signalClose = periodSeconds > 0 ? pendingBarTime + periodSeconds : pendingBarTime;
+   if(ServerDayStart(signalClose) < ServerDayStart(TimeTradeServer()))
    {
-      MarkCurrentBarProcessed(stateIndex);
+      SkipSignal(pendingBarTime, timeframe, "signal en attente expiré depuis la fin du jour broker");
+      MarkSignalProcessed(stateIndex, pendingBarTime);
       return;
+   }
+   if(!TimeframeStates[stateIndex].pendingSignalPrepared
+      && HasActiveTradeForSymbol())
+   {
+      SkipSignal(pendingBarTime, timeframe,
+                 "position ou ordre déjà actif sur le symbole avant lecture du signal");
+      MarkSignalProcessed(stateIndex, pendingBarTime);
+      return;
+   }
+   int pendingSignalShift = -1;
+   if(!TimeframeStates[stateIndex].pendingSignalPrepared)
+   {
+      // The indicator may finish its calculation after this candle is no longer
+      // shift 1. Resolve the original bar by timestamp and read its historical
+      // signal buffers instead of discarding it when the next bar closes.
+      pendingSignalShift = iBarShift(_Symbol, timeframe, pendingBarTime, true);
+      if(pendingSignalShift < 1)
+      {
+         SchedulePendingSignalRetry(stateIndex,
+                                    "bougie signal exacte pas encore clôturée ou chargée");
+         return;
+      }
    }
    if(GetTickCount64() < TimeframeStates[stateIndex].nextSignalReadAttemptMs)
       return;
-   if(!EnsureIndicatorHandle(stateIndex))
+   if(!TimeframeStates[stateIndex].pendingSignalPrepared
+      && !EnsureIndicatorHandle(stateIndex))
    {
-      TimeframeStates[stateIndex].nextSignalReadAttemptMs = GetTickCount64() + 1000;
+      SchedulePendingSignalRetry(stateIndex, "handle de l'indicateur indisponible");
       return;
    }
 
-   int handle = TimeframeStates[stateIndex].indicatorHandle;
-   double buyArrow, sellArrow, entry, stop, tp1, tp2, force, ready;
-   if(!ReadSignalBuffer(handle, SW_BUFFER_READY, 1, ready)
-      || ready != 1.0
-      || !ReadSignalBuffer(handle, SW_BUFFER_BUY, 1, buyArrow)
-      || !ReadSignalBuffer(handle, SW_BUFFER_SELL, 1, sellArrow)
-      || !ReadSignalBuffer(handle, SW_BUFFER_ENTRY, 1, entry)
-      || !ReadSignalBuffer(handle, SW_BUFFER_STOP, 1, stop)
-      || !ReadSignalBuffer(handle, SW_BUFFER_TP1, 1, tp1)
-      || !ReadSignalBuffer(handle, SW_BUFFER_TP2, 1, tp2)
-      || !ReadSignalBuffer(handle, SW_BUFFER_FORCE, 1, force))
+   if(!TimeframeStates[stateIndex].pendingSignalPrepared)
    {
-      ++TimeframeStates[stateIndex].pendingSignalReadAttempts;
-      TimeframeStates[stateIndex].nextSignalReadAttemptMs = GetTickCount64() + 1000;
-      if(TimeframeStates[stateIndex].pendingSignalReadAttempts >= 5)
+      int handle = TimeframeStates[stateIndex].indicatorHandle;
+      double buyArrow = EMPTY_VALUE, sellArrow = EMPTY_VALUE;
+      double entry = EMPTY_VALUE, stop = EMPTY_VALUE;
+      double tp1 = EMPTY_VALUE, tp2 = EMPTY_VALUE, force = EMPTY_VALUE;
+      double ready = EMPTY_VALUE;
+      int calculated = -1, readError = 0;
+      bool readyRead = ReadSignalBufferDetailed(handle, SW_BUFFER_READY, 1,
+                                                ready, calculated, readError);
+      if(!readyRead || ready != 1.0)
       {
-         SkipSignal(pendingBarTime, timeframe, "buffers de l’indicateur indisponibles");
-         MarkCurrentBarProcessed(stateIndex);
+         string detail = readyRead
+                         ? StringFormat("indicateur READY=%.1f", ready)
+                         : StringFormat("buffer READY non lisible (bars=%d erreur=%d)",
+                                        calculated, readError);
+         SchedulePendingSignalRetry(stateIndex, detail);
+         return;
       }
-      return;
+
+      int failedBuffer = -1;
+      if(!ReadSignalBufferDetailed(handle, SW_BUFFER_BUY, pendingSignalShift,
+                                   buyArrow, calculated, readError))
+         failedBuffer = SW_BUFFER_BUY;
+      else if(!ReadSignalBufferDetailed(handle, SW_BUFFER_SELL, pendingSignalShift,
+                                        sellArrow, calculated, readError))
+         failedBuffer = SW_BUFFER_SELL;
+      else if(!ReadSignalBufferDetailed(handle, SW_BUFFER_ENTRY, pendingSignalShift,
+                                        entry, calculated, readError))
+         failedBuffer = SW_BUFFER_ENTRY;
+      else if(!ReadSignalBufferDetailed(handle, SW_BUFFER_STOP, pendingSignalShift,
+                                        stop, calculated, readError))
+         failedBuffer = SW_BUFFER_STOP;
+      else if(!ReadSignalBufferDetailed(handle, SW_BUFFER_TP1, pendingSignalShift,
+                                        tp1, calculated, readError))
+         failedBuffer = SW_BUFFER_TP1;
+      else if(!ReadSignalBufferDetailed(handle, SW_BUFFER_TP2, pendingSignalShift,
+                                        tp2, calculated, readError))
+         failedBuffer = SW_BUFFER_TP2;
+      else if(!ReadSignalBufferDetailed(handle, SW_BUFFER_FORCE, pendingSignalShift,
+                                        force, calculated, readError))
+         failedBuffer = SW_BUFFER_FORCE;
+
+      if(failedBuffer >= 0)
+      {
+         SchedulePendingSignalRetry(stateIndex,
+                                    StringFormat("buffer %d non lisible à shift=%d (bars=%d erreur=%d)",
+                                                 failedBuffer, pendingSignalShift,
+                                                 calculated, readError));
+         return;
+      }
+
+      bool buy = buyArrow != EMPTY_VALUE && MathIsValidNumber(buyArrow);
+      bool sell = sellArrow != EMPTY_VALUE && MathIsValidNumber(sellArrow);
+      if(buy == sell)
+      {
+         if(buy)
+            SkipSignal(pendingBarTime, timeframe, "signaux achat et vente simultanés");
+         MarkSignalProcessed(stateIndex, pendingBarTime);
+         return;
+      }
+      if(force == EMPTY_VALUE || !MathIsValidNumber(force))
+      {
+         SkipSignal(pendingBarTime, timeframe, "force du signal indisponible");
+         MarkSignalProcessed(stateIndex, pendingBarTime);
+         return;
+      }
+      TimeframeStates[stateIndex].pendingSignalDirection = buy ? 1 : -1;
+      TimeframeStates[stateIndex].pendingEntry = entry;
+      TimeframeStates[stateIndex].pendingStop = stop;
+      TimeframeStates[stateIndex].pendingTp1 = tp1;
+      TimeframeStates[stateIndex].pendingTp2 = tp2;
+      TimeframeStates[stateIndex].pendingForce = force;
+      TimeframeStates[stateIndex].pendingSignalPrepared = true;
+      if(!SavePendingSignal(stateIndex))
+      {
+         TimeframeStates[stateIndex].pendingSignalPrepared = false;
+         ++TimeframeStates[stateIndex].pendingSignalReadAttempts;
+         TimeframeStates[stateIndex].nextSignalReadAttemptMs = GetTickCount64()
+               + PendingRetryDelayMilliseconds(TimeframeStates[stateIndex].pendingSignalReadAttempts);
+         if(TimeframeStates[stateIndex].pendingSignalReadAttempts == 5)
+            Print("SWRobots : sauvegarde en attente toujours impossible ; aucun ordre ne sera envoyé sans persistance.");
+         return;
+      }
+      TimeframeStates[stateIndex].pendingSignalReadAttempts = 0;
    }
 
-   datetime signalTime = pendingBarTime;
-   if(!MarkCurrentBarProcessed(stateIndex))
+   datetime signalTime = TimeframeStates[stateIndex].pendingSignalBarTime;
+   bool retryable = false;
+   bool submitted = PlaceSignalOrder(signalTime, timeframe,
+                                     TimeframeStates[stateIndex].pendingSignalDirection,
+                                     TimeframeStates[stateIndex].pendingEntry,
+                                     TimeframeStates[stateIndex].pendingStop,
+                                     TimeframeStates[stateIndex].pendingTp1,
+                                     TimeframeStates[stateIndex].pendingTp2,
+                                     TimeframeStates[stateIndex].pendingForce,
+                                     retryable);
+   if(submitted || !retryable)
    {
-      SkipSignal(signalTime, timeframe, "sauvegarde de la bougie impossible");
+      if(!submitted)
+      {
+         SkipSignal(signalTime, timeframe, "refus définitif ; signal clos sans nouvel essai");
+         if(!SaveMissedSignalState(signalTime, timeframe,
+                                   TimeframeStates[stateIndex].pendingSignalDirection,
+                                   TimeframeStates[stateIndex].pendingEntry))
+            Print("SWRobots : mémorisation du dernier signal non exécuté impossible.");
+      }
+      MarkSignalProcessed(stateIndex, signalTime);
       return;
    }
-   bool buy = buyArrow != EMPTY_VALUE && MathIsValidNumber(buyArrow);
-   bool sell = sellArrow != EMPTY_VALUE && MathIsValidNumber(sellArrow);
-   if(buy == sell)
-   {
-      if(buy)
-         SkipSignal(signalTime, timeframe, "signaux achat et vente simultanés");
-      return;
-   }
-   if(force == EMPTY_VALUE || !MathIsValidNumber(force))
-   {
-      SkipSignal(signalTime, timeframe, "force du signal indisponible");
-      return;
-   }
-   PlaceSignalOrder(signalTime, timeframe, buy ? 1 : -1,
-                    entry, stop, tp1, tp2, force);
+   ++TimeframeStates[stateIndex].pendingSignalReadAttempts;
+   TimeframeStates[stateIndex].nextSignalReadAttemptMs = GetTickCount64()
+         + PendingRetryDelayMilliseconds(TimeframeStates[stateIndex].pendingSignalReadAttempts);
 }
 
 void PollClosedBar(const int stateIndex)
@@ -1342,24 +2234,22 @@ void PollClosedBar(const int stateIndex)
       TimeframeStates[stateIndex].lastObservedBarOpen = currentBarOpen;
       return;
    }
+   datetime closedBarTime = iTime(_Symbol, timeframe, 1);
    if(currentBarOpen != TimeframeStates[stateIndex].lastObservedBarOpen)
    {
       datetime previousBarOpen = TimeframeStates[stateIndex].lastObservedBarOpen;
       TimeframeStates[stateIndex].lastObservedBarOpen = currentBarOpen;
-      datetime closedBarTime = iTime(_Symbol, timeframe, 1);
       int periodSeconds = PeriodSeconds(timeframe);
-      if(closedBarTime <= 0
-         || closedBarTime <= TimeframeStates[stateIndex].lastProcessedSignalTime)
-         return;
       if(periodSeconds > 0 && previousBarOpen > 0
          && currentBarOpen - previousBarOpen > periodSeconds * 2)
       {
-         TimeframeStates[stateIndex].lastProcessedSignalTime = closedBarTime;
-         SaveLastProcessedSignalTime(stateIndex);
          SkipSignal(closedBarTime, timeframe,
-                    "intervalle de marché fermé ou gap de bougies");
-         return;
+                    "bougies intermédiaires manquées ; seule la dernière bougie sera reprise");
       }
+   }
+   if(TimeframeStates[stateIndex].pendingSignalBarTime == 0
+      && closedBarTime > TimeframeStates[stateIndex].lastProcessedSignalTime)
+   {
       TimeframeStates[stateIndex].pendingSignalBarTime = closedBarTime;
       TimeframeStates[stateIndex].pendingSignalReadAttempts = 0;
       TimeframeStates[stateIndex].nextSignalReadAttemptMs = 0;
@@ -1649,7 +2539,10 @@ int OnInit()
       return INIT_PARAMETERS_INCORRECT;
 
    if(!InitializeTimeframes()
-      || InpRiskPercent <= 0.0 || InpRiskPercent > 100.0
+       || InpRiskPercent <= 0.0 || InpRiskPercent > 100.0
+       || InpMaxRiskPerOrderPercent <= 0.0 || InpMaxRiskPerOrderPercent > 100.0
+       || InpMaxPortfolioRiskPercent <= 0.0 || InpMaxPortfolioRiskPercent > 100.0
+       || InpMaxRiskPerOrderPercent > InpMaxPortfolioRiskPercent
       || InpMinimumSignalForce < 0.0 || InpMinimumSignalForce > 100.0
       || InpTp1ClosePercent <= 0.0 || InpTp1ClosePercent >= 100.0
       || InpDailyStopLossLimit < 1 || InpWeeklyStopLossLimit < 1
@@ -1668,7 +2561,8 @@ int OnInit()
       ENUM_TIMEFRAMES timeframe = TimeframeStates[i].timeframe;
       TimeframeStates[i].lastObservedBarOpen = iTime(_Symbol, timeframe, 0);
       string lastKey = InstanceKey(timeframe) + ".LAST";
-      if(GlobalVariableCheck(lastKey))
+      bool hasSavedState = GlobalVariableCheck(lastKey);
+      if(hasSavedState)
          TimeframeStates[i].lastProcessedSignalTime =
             (datetime)GlobalVariableGet(lastKey);
       else
@@ -1676,6 +2570,24 @@ int OnInit()
          TimeframeStates[i].lastProcessedSignalTime = iTime(_Symbol, timeframe, 1);
          if(!SaveLastProcessedSignalTime(i))
             return INIT_FAILED;
+      }
+      TimeframeStates[i].missedScanAfterTime =
+         TimeframeStates[i].lastProcessedSignalTime;
+      TimeframeStates[i].missedScanEnabled = hasSavedState;
+      if(!RestorePendingSignal(i))
+         return INIT_FAILED;
+      if(TimeframeStates[i].pendingSignalPrepared
+         && TimeframeStates[i].pendingSignalBarTime
+            > TimeframeStates[i].missedScanAfterTime)
+         TimeframeStates[i].missedScanAfterTime =
+            TimeframeStates[i].pendingSignalBarTime;
+      datetime lastClosedBar = iTime(_Symbol, timeframe, 1);
+      if(!TimeframeStates[i].pendingSignalPrepared
+         && lastClosedBar > TimeframeStates[i].lastProcessedSignalTime)
+      {
+         TimeframeStates[i].pendingSignalBarTime = lastClosedBar;
+         Print("SWRobots : reprise de la dernière bougie clôturée après redémarrage sur ",
+               EnumToString(timeframe), ".");
       }
    }
 
@@ -1693,6 +2605,9 @@ int OnInit()
       timeframeList += EnumToString(TimeframeStates[i].timeframe);
       EnsureIndicatorHandle(i);
    }
+   RestoreMissedSignalState();
+   CaptureMissedSignalHistory(true);
+   SyncActiveSignalMarker(true);
    Print("SWRobots prêt sur ", _Symbol, " ; timeframes surveillés : ", timeframeList, ".");
    return INIT_SUCCEEDED;
 }
@@ -1700,6 +2615,8 @@ int OnInit()
 void OnDeinit(const int reason)
 {
    EventKillTimer();
+   if(reason != REASON_CLOSE)
+      RemoveActiveSignalMarker();
    for(int i = 0; i < TimeframeCount; ++i)
    {
       if(TimeframeStates[i].indicatorHandle != INVALID_HANDLE)
@@ -1712,6 +2629,8 @@ void OnDeinit(const int reason)
 
 void RunCycle()
 {
+   CaptureMissedSignalHistory();
+   SyncActiveSignalMarker();
    if(!ConnectedAndReady())
       return;
    CancelPendingOrdersWhenPaused();
@@ -1734,6 +2653,7 @@ void OnTradeTransaction(const MqlTradeTransaction &transaction,
                         const MqlTradeRequest &request,
                         const MqlTradeResult &result)
 {
+   SyncActiveSignalMarker(true);
    if(transaction.type != TRADE_TRANSACTION_DEAL_ADD || transaction.deal == 0
       || !HistoryDealSelect(transaction.deal))
       return;

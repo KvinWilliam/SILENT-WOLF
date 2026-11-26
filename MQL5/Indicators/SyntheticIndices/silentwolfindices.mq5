@@ -2,7 +2,7 @@
 #property indicator_chart_window
 #property version   "1.00"
 #property indicator_buffers 8
-#property indicator_plots   8
+#property indicator_plots   2
 
 #property indicator_label1  "Bullish pin bar fusion"
 #property indicator_type1   DRAW_ARROW
@@ -14,18 +14,7 @@
 #property indicator_color2  clrTomato
 #property indicator_width2  2
 
-#property indicator_label3  "SW Entry"
-#property indicator_type3   DRAW_NONE
-#property indicator_label4  "SW Stop"
-#property indicator_type4   DRAW_NONE
-#property indicator_label5  "SW TP1"
-#property indicator_type5   DRAW_NONE
-#property indicator_label6  "SW TP2"
-#property indicator_type6   DRAW_NONE
-#property indicator_label7  "SW Force"
-#property indicator_type7   DRAW_NONE
-#property indicator_label8  "SW Ready"
-#property indicator_type8   DRAW_NONE
+// Buffers 2..7 are machine-readable values for SWRobots, not chart plots.
 
 enum ENUM_STOP_BUFFER_MODE
 {
@@ -56,8 +45,29 @@ enum ENUM_REJECTION_REASON
 
 struct ChartZone
 {
+   ulong id;
    datetime start;
    datetime end;
+   double low;
+   double high;
+   int direction;
+};
+
+enum ENUM_ZONE_HISTORY_KIND
+{
+   ZONE_HISTORY_UPSERT = 1,
+   ZONE_HISTORY_DELETE = 2,
+   ZONE_HISTORY_RESET = 3
+};
+
+struct ZoneHistoryRecord
+{
+   int version;
+   int kind;
+   long eventTime;
+   ulong id;
+   long start;
+   long end;
    double low;
    double high;
    int direction;
@@ -137,6 +147,7 @@ input bool   InpAutoCompactTable        = true;  // Adapter le nombre de lignes 
 // une modification de zone en cours de barre peut aussi émettre l'alerte
 // (comportement P3 antérieur).
 input bool   InpAlertOnZoneChange       = false; // C-R1 : alerter aussi en cours de barre
+input string InpZoneHistoryKey          = "main"; // Identifiant stable du jeu de zones archivé
 
 double BullishBuffer[];
 double BearishBuffer[];
@@ -191,6 +202,10 @@ int FoundPatternCount = 0;
 int DuplicateSignalCount = 0;
 int AcceptedSignalCount = 0;
 int UnclassifiedRejectionCount = 0;
+bool CachedBullishSwingSignalUsed = false;
+bool CachedBearishSwingSignalUsed = false;
+datetime CachedLastBullishSignalTime = 0;
+datetime CachedLastBearishSignalTime = 0;
 
 string TableCellPrefix = "PatternFusionPinBarCellV2";
 string TablePanelName = "PatternFusionPinBarFloatingPanel";
@@ -200,10 +215,294 @@ int TableX = 0;
 int TableY = 12;
 bool TablePositionCustomized = false;
 ChartZone ChartZones[];
+ChartZone LiveChartZones[];
+ChartZone ZoneHistoryCurrentZones[];
+ZoneHistoryRecord ZoneHistoryEvents[];
+bool ZoneHistoryLoaded = false;
+ulong ZoneHistoryFileBytes = 0;
+int ZoneHistoryAppliedIndex = 0;
+bool ZoneHistorySessionStarted = false;
+datetime ZoneHistoryFirstUpsertTime = 0;
 
 string TablePositionKey(const string axis)
 {
    return "PBF.table." + IntegerToString(ChartID()) + "." + axis;
+}
+uint ZoneHistoryHash(const string value)
+{
+   uint hash = 2166136261;
+   for(int i = 0; i < StringLen(value); ++i)
+      hash = (hash ^ (uint)StringGetCharacter(value, i)) * 16777619;
+   return hash;
+}
+
+ulong ZoneObjectId(const string name)
+{
+   uint hash = ZoneHistoryHash(name);
+   return hash == 0 ? 1 : (ulong)hash;
+}
+
+string ZoneHistoryPath()
+{
+   string server = AccountInfoString(ACCOUNT_SERVER);
+   string identity = IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) + "_"
+                     + IntegerToString((int)ZoneHistoryHash(server)) + "_"
+                     + IntegerToString((int)ZoneHistoryHash(_Symbol));
+   return "SilentWolf\\ZoneHistory\\" + identity + "_"
+          + IntegerToString((int)ZoneHistoryHash(InpZoneHistoryKey)) + ".v1.bin";
+}
+
+bool ZoneHistoryRecordValid(const ZoneHistoryRecord &record)
+{
+   if(record.version != 1 || record.eventTime <= 0
+      || (record.kind != ZONE_HISTORY_UPSERT && record.kind != ZONE_HISTORY_DELETE
+          && record.kind != ZONE_HISTORY_RESET))
+      return false;
+   if(record.kind == ZONE_HISTORY_RESET)
+      return true;
+   if(record.id == 0 || record.kind == ZONE_HISTORY_DELETE)
+      return true;
+   return record.start > 0 && record.end >= record.start
+          && MathIsValidNumber(record.low) && MathIsValidNumber(record.high)
+          && record.low > 0.0 && record.high >= record.low
+          && (record.direction == 1 || record.direction == -1);
+}
+
+int FindZoneById(const ChartZone &zones[], const ulong id)
+{
+   for(int i = 0; i < ArraySize(zones); ++i)
+      if(zones[i].id == id)
+         return i;
+   return -1;
+}
+
+void ApplyZoneHistoryRecord(const ZoneHistoryRecord &record, ChartZone &zones[])
+{
+   if(record.kind == ZONE_HISTORY_RESET)
+   {
+      ArrayResize(zones, 0);
+      return;
+   }
+   int index = FindZoneById(zones, record.id);
+   if(record.kind == ZONE_HISTORY_DELETE)
+   {
+      if(index >= 0)
+      {
+         for(int i = index; i + 1 < ArraySize(zones); ++i)
+            zones[i] = zones[i + 1];
+         ArrayResize(zones, ArraySize(zones) - 1);
+      }
+      return;
+   }
+   ChartZone zone;
+   zone.id = record.id;
+   zone.start = (datetime)record.start;
+   zone.end = (datetime)record.end;
+   zone.low = record.low;
+   zone.high = record.high;
+   zone.direction = record.direction;
+   if(index < 0)
+   {
+      int size = ArraySize(zones);
+      if(ArrayResize(zones, size + 1) == size + 1)
+         zones[size] = zone;
+   }
+   else
+      zones[index] = zone;
+}
+
+bool LoadZoneHistory()
+{
+   string path = ZoneHistoryPath();
+   ArrayResize(ZoneHistoryEvents, 0);
+   ArrayResize(ZoneHistoryCurrentZones, 0);
+   ZoneHistoryFileBytes = 0;
+   ZoneHistoryAppliedIndex = 0;
+   ZoneHistoryFirstUpsertTime = 0;
+   if(!FileIsExist(path, FILE_COMMON))
+   {
+      ZoneHistoryLoaded = true;
+      return true;
+   }
+   int file = FileOpen(path, FILE_READ | FILE_BIN | FILE_COMMON | FILE_SHARE_READ | FILE_SHARE_WRITE);
+   if(file == INVALID_HANDLE)
+   {
+      Print("SilentWolf : journal des zones inaccessible : ", GetLastError());
+      ZoneHistoryLoaded = false;
+      return false;
+   }
+   ulong size = FileSize(file);
+   int recordSize = sizeof(ZoneHistoryRecord);
+   if(recordSize <= 0 || size % (ulong)recordSize != 0)
+   {
+      FileClose(file);
+      Print("SilentWolf : journal des zones incomplet ou corrompu.");
+      ZoneHistoryLoaded = false;
+      return false;
+   }
+   long lastEventTime = 0;
+   while(!FileIsEnding(file))
+   {
+      ZoneHistoryRecord record;
+      if(FileReadStruct(file, record) != recordSize || !ZoneHistoryRecordValid(record)
+         || record.eventTime < lastEventTime)
+      {
+         FileClose(file);
+         Print("SilentWolf : événement de zone invalide ; signaux bloqués jusqu'à réparation du journal.");
+         ZoneHistoryLoaded = false;
+         return false;
+      }
+      lastEventTime = record.eventTime;
+      if(record.kind == ZONE_HISTORY_UPSERT
+         && (ZoneHistoryFirstUpsertTime == 0
+             || record.eventTime < ZoneHistoryFirstUpsertTime))
+         ZoneHistoryFirstUpsertTime = (datetime)record.eventTime;
+      int count = ArraySize(ZoneHistoryEvents);
+      if(ArrayResize(ZoneHistoryEvents, count + 1) != count + 1)
+      {
+         FileClose(file);
+         ZoneHistoryLoaded = false;
+         return false;
+      }
+      ZoneHistoryEvents[count] = record;
+      ApplyZoneHistoryRecord(record, ZoneHistoryCurrentZones);
+   }
+   FileClose(file);
+   ZoneHistoryFileBytes = size;
+   ZoneHistoryLoaded = true;
+   return true;
+}
+
+bool ReloadZoneHistoryIfChanged()
+{
+   string path = ZoneHistoryPath();
+   ulong size = FileIsExist(path, FILE_COMMON) ? (ulong)FileGetInteger(path, FILE_SIZE, true) : 0;
+   if(!ZoneHistoryLoaded || size != ZoneHistoryFileBytes)
+      return LoadZoneHistory();
+   return true;
+}
+
+bool AppendZoneHistoryRecord(const int kind, const ChartZone &zone)
+{
+   if(!ZoneHistoryLoaded && !LoadZoneHistory())
+      return false;
+   FolderCreate("SilentWolf", FILE_COMMON);
+   FolderCreate("SilentWolf\\ZoneHistory", FILE_COMMON);
+   ZoneHistoryRecord record;
+   ZeroMemory(record);
+   record.version = 1;
+   record.kind = kind;
+   record.eventTime = (long)TimeTradeServer();
+   if(ArraySize(ZoneHistoryEvents) > 0)
+      record.eventTime = MathMax(record.eventTime,
+                                 ZoneHistoryEvents[ArraySize(ZoneHistoryEvents) - 1].eventTime);
+   record.id = zone.id;
+   record.start = (long)zone.start;
+   record.end = (long)zone.end;
+   record.low = zone.low;
+   record.high = zone.high;
+   record.direction = zone.direction;
+   if(kind == ZONE_HISTORY_DELETE)
+   {
+      record.start = 0;
+      record.end = 0;
+      record.low = 0.0;
+      record.high = 0.0;
+      record.direction = 0;
+   }
+   if(!ZoneHistoryRecordValid(record))
+      return false;
+   string path = ZoneHistoryPath();
+   int file = FileOpen(path, FILE_READ | FILE_WRITE | FILE_BIN | FILE_COMMON | FILE_SHARE_READ | FILE_SHARE_WRITE);
+   if(file == INVALID_HANDLE)
+   {
+      Print("SilentWolf : écriture du journal des zones impossible : ", GetLastError());
+      return false;
+   }
+   if(!FileSeek(file, 0, SEEK_END) || FileWriteStruct(file, record) != sizeof(ZoneHistoryRecord))
+   {
+      FileClose(file);
+      Print("SilentWolf : événement de zone non enregistré : ", GetLastError());
+      return false;
+   }
+   FileFlush(file);
+   ulong size = FileSize(file);
+   FileClose(file);
+   int count = ArraySize(ZoneHistoryEvents);
+   if(ArrayResize(ZoneHistoryEvents, count + 1) != count + 1)
+   {
+      ZoneHistoryLoaded = false;
+      return false;
+   }
+   ZoneHistoryEvents[count] = record;
+   if(record.kind == ZONE_HISTORY_UPSERT
+      && (ZoneHistoryFirstUpsertTime == 0
+          || record.eventTime < ZoneHistoryFirstUpsertTime))
+      ZoneHistoryFirstUpsertTime = (datetime)record.eventTime;
+   ApplyZoneHistoryRecord(record, ZoneHistoryCurrentZones);
+   ZoneHistoryFileBytes = size;
+   return true;
+}
+
+bool SynchronizeZoneHistory()
+{
+   if(!ReloadZoneHistoryIfChanged())
+      return false;
+   if(!ZoneHistorySessionStarted)
+   {
+      if(ArraySize(ZoneHistoryEvents) > 0)
+      {
+         ChartZone resetZone;
+         ZeroMemory(resetZone);
+         resetZone.id = 1;
+         if(!AppendZoneHistoryRecord(ZONE_HISTORY_RESET, resetZone))
+            return false;
+      }
+      ZoneHistorySessionStarted = true;
+   }
+   for(int i = 0; i < ArraySize(LiveChartZones); ++i)
+   {
+      int old = FindZoneById(ZoneHistoryCurrentZones, LiveChartZones[i].id);
+      bool changed = old < 0;
+      if(!changed)
+      {
+         ChartZone previous = ZoneHistoryCurrentZones[old];
+         ChartZone current = LiveChartZones[i];
+         changed = previous.start != current.start || previous.end != current.end
+                  || previous.low != current.low || previous.high != current.high
+                  || previous.direction != current.direction;
+      }
+      if(changed && !AppendZoneHistoryRecord(ZONE_HISTORY_UPSERT, LiveChartZones[i]))
+         return false;
+   }
+   for(int i = 0; i < ArraySize(ZoneHistoryCurrentZones);)
+   {
+      if(FindZoneById(LiveChartZones, ZoneHistoryCurrentZones[i].id) < 0)
+      {
+         ChartZone removed = ZoneHistoryCurrentZones[i];
+         if(!AppendZoneHistoryRecord(ZONE_HISTORY_DELETE, removed))
+            return false;
+      }
+      else
+         ++i;
+   }
+   return true;
+}
+
+void ResetZoneHistoryReplay()
+{
+   ArrayResize(ChartZones, 0);
+   ZoneHistoryAppliedIndex = 0;
+}
+
+void ApplyZoneHistoryUntil(const datetime exclusiveTime)
+{
+   while(ZoneHistoryAppliedIndex < ArraySize(ZoneHistoryEvents)
+         && ZoneHistoryEvents[ZoneHistoryAppliedIndex].eventTime < exclusiveTime)
+   {
+      ApplyZoneHistoryRecord(ZoneHistoryEvents[ZoneHistoryAppliedIndex], ChartZones);
+      ++ZoneHistoryAppliedIndex;
+   }
 }
 
 int EffectivePinSwingLookbackBars()
@@ -539,7 +838,7 @@ bool RefreshChartZones()
       Print("SilentWolf : lecture des zones impossible : ", GetLastError());
       return false;
    }
-   if(ArrayResize(ChartZones, objectCount) != objectCount)
+   if(ArrayResize(LiveChartZones, objectCount) != objectCount)
    {
       Print("Impossible de mettre en cache les rectangles de zones. Erreur: ",
             GetLastError());
@@ -576,54 +875,55 @@ bool RefreshChartZones()
                GetLastError());
          return false;
       }
-      ChartZones[zoneCount].start = (datetime)(time1 < time2 ? time1 : time2);
-      ChartZones[zoneCount].end = (datetime)(time1 > time2 ? time1 : time2);
-      ChartZones[zoneCount].low = MathMin(price1, price2);
-      ChartZones[zoneCount].high = MathMax(price1, price2);
-      ChartZones[zoneCount].direction = direction;
+      LiveChartZones[zoneCount].id = ZoneObjectId(objectName);
+      LiveChartZones[zoneCount].start = (datetime)(time1 < time2 ? time1 : time2);
+      LiveChartZones[zoneCount].end = (datetime)(time1 > time2 ? time1 : time2);
+      LiveChartZones[zoneCount].low = MathMin(price1, price2);
+      LiveChartZones[zoneCount].high = MathMax(price1, price2);
+      LiveChartZones[zoneCount].direction = direction;
       ++zoneCount;
    }
 
-   if(ArrayResize(ChartZones, zoneCount) != zoneCount)
+   if(ArrayResize(LiveChartZones, zoneCount) != zoneCount)
    {
       Print("Impossible d'ajuster le cache des rectangles de zones. Erreur: ",
             GetLastError());
       return false;
    }
-   return true;
+   if(InpInternalBufferOnly)
+      return ReloadZoneHistoryIfChanged();
+   return SynchronizeZoneHistory();
 }
 
-bool RefreshInternalZones(bool &changed)
+bool RefreshZonesIfChanged(bool &changed)
 {
+   ulong previousHistoryBytes = ZoneHistoryFileBytes;
    ChartZone previous[];
-   int count = ArraySize(ChartZones);
+   int count = ArraySize(LiveChartZones);
    if(ArrayResize(previous, count) != count
-      || (count > 0 && ArrayCopy(previous, ChartZones) != count))
+      || (count > 0 && ArrayCopy(previous, LiveChartZones) != count))
    {
       Print("Impossible de sauvegarder les zones avant leur actualisation. Erreur: ", GetLastError());
       return false;
    }
    if(!RefreshChartZones())
       return false;
-   changed = count != ArraySize(ChartZones);
+   changed = count != ArraySize(LiveChartZones);
    for(int i = 0; !changed && i < count; ++i)
-      changed = previous[i].start != ChartZones[i].start
-                || previous[i].end != ChartZones[i].end
-                || previous[i].low != ChartZones[i].low
-                || previous[i].high != ChartZones[i].high
-                || previous[i].direction != ChartZones[i].direction;
+      changed = previous[i].start != LiveChartZones[i].start
+                || previous[i].end != LiveChartZones[i].end
+                || previous[i].low != LiveChartZones[i].low
+                || previous[i].high != LiveChartZones[i].high
+                || previous[i].direction != LiveChartZones[i].direction;
+   changed = changed || ZoneHistoryFileBytes != previousHistoryBytes;
    return true;
 }
 
 int OldestZoneSignalIndex(const int limit, const datetime &time[])
 {
-   int count = ArraySize(ChartZones);
-   if(count == 0)
+   datetime firstStart = ZoneHistoryFirstUpsertTime;
+   if(firstStart == 0)
       return 0;
-   datetime firstStart = ChartZones[0].start;
-   for(int index = 1; index < count; ++index)
-      if(ChartZones[index].start < firstStart)
-         firstStart = ChartZones[index].start;
 
    int first = 1, last = limit, result = 0;
    while(first <= last)
@@ -2255,7 +2555,10 @@ int OnInit()
       || InpHaramiCrossMaxBodyRatio < 0.0 || InpHaramiCrossMaxBodyRatio > 1.0
       || InpZeroBodyFloorRangeFraction < 0.0
       // A1 : validation des nouveaux inputs, même mécanisme que les autres.
-      || InpInsideBarMaxRatio <= 0.0)
+       || InpInsideBarMaxRatio <= 0.0
+       || InpZoneHistoryKey == "" || StringLen(InpZoneHistoryKey) > 48
+       || StringFind(InpZoneHistoryKey, "\\") >= 0
+       || StringFind(InpZoneHistoryKey, "/") >= 0)
       return INIT_PARAMETERS_INCORRECT;
 
    if(!InpInternalBufferOnly)
@@ -2325,14 +2628,12 @@ int OnInit()
    PlotIndexSetInteger(1, PLOT_ARROW, 234);
    PlotIndexSetDouble(0, PLOT_EMPTY_VALUE, EMPTY_VALUE);
    PlotIndexSetDouble(1, PLOT_EMPTY_VALUE, EMPTY_VALUE);
-   for(int plot = 2; plot < 8; ++plot)
-      PlotIndexSetDouble(plot, PLOT_EMPTY_VALUE, EMPTY_VALUE);
    IndicatorSetInteger(INDICATOR_DIGITS, _Digits);
    IndicatorSetString(INDICATOR_SHORTNAME, "silentwolfindices");
    if(InpInternalBufferOnly)
       return INIT_SUCCEEDED;
-   Print("PinBarFusion : les signaux historiques sont recalculés avec les zones actuelles ; "
-         "ils ne prouvent pas qu'une zone existait au moment du signal.");
+   Print("PinBarFusion : seuls les signaux couverts par l'archive chronologique des zones "
+         "sont calculés ; l'historique antérieur n'est pas reconstitué.");
 
    // C11 : CHARTEVENT_OBJECT_CREATE et CHARTEVENT_OBJECT_DELETE ne sont
    // délivrés que si CHART_EVENT_OBJECT_CREATE / _DELETE sont vrais pour le
@@ -2430,6 +2731,7 @@ int OnCalculate(const int rates_total, const int prev_calculated,
 
    bool firstCalculation = LastBarTime == 0;
    bool newBar = !firstCalculation && time[0] != LastBarTime;
+   bool missedBars = false;
    // C8 : l'alerte de la barre est mémorisée dès sa détection. Elle n'est
    // consommée qu'une fois le recalcul mené à bien, donc un échec de
    // RefreshChartZones() ne la perd plus.
@@ -2437,9 +2739,12 @@ int OnCalculate(const int rates_total, const int prev_calculated,
    {
       int previousBarShift = iBarShift(_Symbol, _Period, LastBarTime, true);
       if(previousBarShift > 1)
+      {
+         missedBars = true;
          PrintFormat("PinBarFusion : %d barres intermédiaires non alertées ; "
                      "les alertes historiques ne sont pas reconstituées.",
                      previousBarShift - 1);
+      }
       PendingNewBarAlert = true;
       // P3 (b) : le compteur de relances est réarmé à chaque nouvelle barre.
       DataRetryCount = 0;
@@ -2447,7 +2752,7 @@ int OnCalculate(const int rates_total, const int prev_calculated,
    if(InpInternalBufferOnly && newBar)
    {
       bool zonesChanged = false;
-      if(!RefreshInternalZones(zonesChanged))
+      if(!RefreshZonesIfChanged(zonesChanged))
       {
          SignalsDirty = true;
          SignalReadyBuffer[1] = 0.0;
@@ -2456,7 +2761,7 @@ int OnCalculate(const int rates_total, const int prev_calculated,
       if(zonesChanged)
          SignalsDirty = true;
    }
-   bool fullRecalculation = prev_calculated == 0 || SignalsDirty;
+   bool fullRecalculation = prev_calculated == 0 || SignalsDirty || missedBars;
    bool recalculateSignals = fullRecalculation || newBar || PendingNewBarAlert;
    if(!recalculateSignals && LatestSignalTime > 0)
    {
@@ -2518,6 +2823,7 @@ int OnCalculate(const int rates_total, const int prev_calculated,
          SignalReadyBuffer[1] = 0.0;
          return 0;
       }
+      ResetZoneHistoryReplay();
       ArrayInitialize(BullishBuffer, EMPTY_VALUE);
       ArrayInitialize(BearishBuffer, EMPTY_VALUE);
       ArrayInitialize(SignalEntryBuffer, EMPTY_VALUE);
@@ -2599,8 +2905,28 @@ int OnCalculate(const int rates_total, const int prev_calculated,
    int latestActiveDirection = 0;
 
    int searchOldestIndex = OldestZoneSignalIndex(oldestSignalIndex, time);
-   for(int i = searchOldestIndex; i >= 1; --i)
+   // Rejouer tout l'historique uniquement à l'initialisation ou après une
+   // modification des zones. Sur une nouvelle bougie normale, l'état de
+   // déduplication mis en cache suffit pour traiter la seule bougie clôturée.
+   int scanOldestIndex = fullRecalculation ? searchOldestIndex : 1;
+   if(fullRecalculation)
    {
+      bullishSwingSignalUsed = false;
+      bearishSwingSignalUsed = false;
+      lastBullishSignalTime = 0;
+      lastBearishSignalTime = 0;
+   }
+   else
+   {
+      bullishSwingSignalUsed = CachedBullishSwingSignalUsed;
+      bearishSwingSignalUsed = CachedBearishSwingSignalUsed;
+      lastBullishSignalTime = CachedLastBullishSignalTime;
+      lastBearishSignalTime = CachedLastBearishSignalTime;
+   }
+   for(int i = scanOldestIndex; i >= 1; --i)
+   {
+      datetime confirmationCloseTime = time[i - 1];
+      ApplyZoneHistoryUntil(confirmationCloseTime);
       int pivotIndex = i + InpSwingLookbackBars;
       if(bullishSwingSignalUsed
          && IsConfirmedSwingPivot(pivotIndex, true, rates_total, high, low)
@@ -2704,7 +3030,12 @@ int OnCalculate(const int rates_total, const int prev_calculated,
       LatestStopPrice = stopPrice;
    }
 
-   int displayedIndex = DisplayedSignalIndex(latestSignalIndex, previousShift, oldestSignalIndex);
+   CachedBullishSwingSignalUsed = bullishSwingSignalUsed;
+   CachedBearishSwingSignalUsed = bearishSwingSignalUsed;
+   CachedLastBullishSignalTime = lastBullishSignalTime;
+   CachedLastBearishSignalTime = lastBearishSignalTime;
+
+    int displayedIndex = DisplayedSignalIndex(latestSignalIndex, previousShift, scanOldestIndex);
    if(displayedIndex != latestSignalIndex)
    {
       latestSignalIndex = displayedIndex;
@@ -2968,7 +3299,12 @@ void OnChartEvent(const int id, const long &lparam,
          return;
       if(sparam == "" || StringFind(sparam, InpBullishZonePrefix) == 0
          || StringFind(sparam, InpBearishZonePrefix) == 0)
+      {
          SignalsDirty = true;
+         bool zonesChanged = false;
+         if(!RefreshZonesIfChanged(zonesChanged))
+            SignalsDirty = true;
+      }
    }
 }
 
@@ -3391,7 +3727,12 @@ bool DrawSelectedTool(const datetime second_time, const double second_price)
    ObjectSetInteger(0, name, OBJPROP_HIDDEN, false);
    ObjectSetInteger(0, name, OBJPROP_TIMEFRAMES, OBJ_ALL_PERIODS);
    if(active_tool <= TOOL_RECTANGLE_BEAR)
+   {
       SignalsDirty = true;
+      // Archiver la zone dès sa création par les outils de l'indicateur.
+      if(!RefreshChartZones())
+         SignalsDirty = true;
+   }
    return true;
 }
 
@@ -3436,6 +3777,10 @@ color ToolColor(const int index)
 
 void OnTimer()
 {
+   // Rattraper un événement de rectangle manqué sans rescanner les bougies.
+   bool zonesChanged = false;
+   if(!RefreshZonesIfChanged(zonesChanged) || zonesChanged)
+      SignalsDirty = true;
    SwRefreshInfo();
    if(InpShowTable) UpdateSignalTable();
 }
